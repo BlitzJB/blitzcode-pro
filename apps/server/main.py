@@ -1,12 +1,15 @@
 import asyncio
 import contextlib
+import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from agent_webkit_server.adapters.fastapi import create_app
 from agent_webkit_server.auth import AuthConfig
@@ -53,6 +56,44 @@ _SESSIONS_DIR = Path(
 _WORKSPACES_ROOT = Path(
     os.environ.get("BLITZCODE_PRO_WORKSPACES_ROOT", str(_BLITZ_PRO_ROOT / "workspaces"))
 )
+
+# Bundled mode: the Tauri shell sets this to "1" so we know to route logs
+# to disk and trust the embedded port. Defaults to dev behavior (stderr
+# logs, dev port).
+_BUNDLED = os.environ.get("BLITZCODE_PRO_BUNDLED") == "1"
+
+
+def _install_file_logging() -> None:
+    """Route Python + uvicorn logs to ~/.blitzcode-pro/logs/server.log
+    with rotation. Called only when running as a packaged app. In dev,
+    uvicorn keeps its colorful stderr output."""
+    log_dir = _BLITZ_PRO_ROOT / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "server.log",
+        maxBytes=2_000_000,         # 2 MB per file
+        backupCount=4,              # keep .1 through .4
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s — %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    ))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Replace handlers so we don't double-log to stderr inside the .app.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(handler)
+    # Uvicorn / FastAPI loggers — make them propagate to root.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.propagate = True
+
+
+if _BUNDLED:
+    _install_file_logging()
 
 metadata_store = FileSessionMetadataStore(_SESSIONS_DIR)
 ack_store = AckStore(
@@ -122,9 +163,18 @@ app = create_app(
     extra_allowed_tools=_workflow_extra_allowed_tools,
 )
 
+# CORS — only needed in dev where the Next dev server sits on a different
+# port. The bundled .app serves frontend + API from the same origin so
+# the middleware becomes a no-op there. Dev ports are non-standard
+# (51820/51821) to avoid colliding with the long tail of other tools
+# that grab 3000/8000.
+_DEV_WEB_ORIGINS = [
+    "http://localhost:51821",
+    "http://127.0.0.1:51821",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_DEV_WEB_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -725,5 +775,28 @@ async def patch_settings(updates: dict) -> dict:
     return {"settings": merged}
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Static frontend mount — bundled .app sets BLITZCODE_PRO_WEB_DIST to the
+# Next.js static export. In dev we leave this unmounted and the Next dev
+# server serves the UI on its own port. Mounted LAST so /app/* and
+# /sessions/* routes always win.
+# ────────────────────────────────────────────────────────────────────────────
+
+_web_dist = os.environ.get("BLITZCODE_PRO_WEB_DIST")
+if _web_dist:
+    _web_path = Path(_web_dist).expanduser().resolve()
+    if _web_path.is_dir():
+        # `html=True` makes /foo serve /foo.html or /foo/index.html — matches
+        # what Next's static export emits and gives us "real" routing.
+        app.mount("/", StaticFiles(directory=str(_web_path), html=True), name="web")
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Port priority: explicit env > dev default. Bundled mode sets the
+    # env var to an ephemeral port chosen by the Rust shell.
+    port = int(os.environ.get("BLITZCODE_PRO_PORT", "51820"))
+    host = os.environ.get("BLITZCODE_PRO_HOST", "127.0.0.1")
+    # When bundled, suppress uvicorn's own log_config so our root file
+    # handler captures everything (otherwise dictConfig stomps it).
+    log_config = None if _BUNDLED else uvicorn.config.LOGGING_CONFIG
+    uvicorn.run(app, host=host, port=port, log_config=log_config)

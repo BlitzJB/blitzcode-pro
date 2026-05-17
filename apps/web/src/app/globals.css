@@ -1,10 +1,30 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
+/* Tailwind v4 dark variant — selector-driven, not media-driven, so the
+   user's explicit Light/Dark/System choice wins. The boot script in
+   layout.tsx writes [data-theme="dark"] before first paint to prevent
+   FOUC on dark-mode reloads. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+/* `tauri:foo` applies only when the app is running inside the Tauri
+   shell — used to reserve room for the overlay traffic lights without
+   making browser dev mode look weird. The FOUC script in layout.tsx
+   stamps data-tauri="1" on <html> when window.__TAURI_INTERNALS__ is
+   present. */
+@custom-variant tauri (&:where([data-tauri="1"], [data-tauri="1"] *));
+/* `tauri-windowed:foo` is the common case — we want to reserve room
+   for the overlay traffic lights only when actually visible. In
+   macOS native fullscreen the traffic lights vanish, so the padding
+   should retract. The hook in chat.tsx stamps data-fullscreen on
+   <html> whenever the window enters fullscreen. */
+@custom-variant tauri-windowed (&:where([data-tauri="1"]:not([data-fullscreen]), [data-tauri="1"]:not([data-fullscreen]) *));
+
 /* ────────────────────────────────────────────────────────────────────────────
    Design tokens — warm-bone canvas, tinted neutrals, restrained accents.
-   Light mode only (no @media dark override) — this is a daylight tool.
-   ──────────────────────────────────────────────────────────────────────────── */
+   The dark palette below mirrors the light one in spirit: warm-tinted
+   near-black surfaces (not cool slate), accents lifted in L so they read
+   on dark, tints inverted from pale-wash to dark-wash of the same hue.
+   ──────────────────────────────────────────────────────────────────────── */
 :root {
   /* Surfaces */
   --canvas: #fbfbfa;          /* page background (warm bone) */
@@ -43,6 +63,40 @@
   --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+[data-theme="dark"] {
+  /* Surfaces — canvas is base; surface lifts above; sunk recedes below;
+     tinted is the most-lifted accent for user bubbles. */
+  --canvas: #161614;
+  --surface: #1f1e1c;
+  --surface-sunk: #0f0f0e;
+  --surface-tinted: #272620;
+
+  /* Text — inverse ramp, off-white tinted warm. */
+  --ink: #f0efe8;
+  --ink-soft: #c9c7bd;
+  --ink-muted: #9a988e;
+  --ink-faint: #6b6a62;
+
+  /* Lines — visible but quiet, warm-tinted. */
+  --line: #2c2b27;
+  --line-strong: #3d3b35;
+
+  /* Accents — same hue as light, L lifted ~12pts to read on dark. */
+  --accent-warm: #e07d5d;
+  --accent-cool: #5fa6d3;
+  --accent-purple: #a48cd9;
+  --accent-ok: #6fa775;
+  --accent-warn: #d0a052;
+  --accent-err: #d97370;
+
+  /* Tints — role-inverted: pale-wash → dark-wash of the same hue. */
+  --tint-cool: #1d2a36;
+  --tint-purple: #29243a;
+  --tint-ok: #1f2e22;
+  --tint-warn: #36301c;
+  --tint-err: #3a221f;
+}
+
 @theme inline {
   --color-canvas: var(--canvas);
   --color-surface: var(--surface);
@@ -75,6 +129,44 @@ html, body {
   background: var(--canvas);
   color: var(--ink);
   color-scheme: light;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+/* Override @tailwindcss/typography defaults so prose content follows our
+   tokens. Tailwind v4 emits the plugin's rules in a layer that beats
+   plain `.prose { --tw-prose-* }` overrides, so we set the CSS vars AND
+   write explicit element rules with higher specificity (.prose.prose)
+   to win the cascade for borders + dividers. Light + dark both go
+   through these — borders should always read as `--line`. */
+.prose,
+.prose.prose {
+  --tw-prose-body: var(--ink);
+  --tw-prose-headings: var(--ink);
+  --tw-prose-lead: var(--ink-soft);
+  --tw-prose-links: var(--accent-cool);
+  --tw-prose-bold: var(--ink);
+  --tw-prose-counters: var(--ink-faint);
+  --tw-prose-bullets: var(--ink-faint);
+  --tw-prose-hr: var(--line);
+  --tw-prose-quotes: var(--ink-soft);
+  --tw-prose-quote-borders: var(--line-strong);
+  --tw-prose-captions: var(--ink-muted);
+  --tw-prose-code: var(--ink);
+  --tw-prose-pre-code: var(--ink-soft);
+  --tw-prose-pre-bg: var(--surface-sunk);
+  --tw-prose-th-borders: var(--line);
+  --tw-prose-td-borders: var(--line);
+}
+/* Belt-and-suspenders: target the elements directly. The typography
+   plugin uses :where() (specificity 0) for its rules, so a plain
+   `.prose <tag>` selector beats it without needing !important. */
+.prose :is(thead, tbody, tfoot, tr, th, td, hr) {
+  border-color: var(--line);
+}
+.prose blockquote {
+  border-color: var(--line-strong);
 }
 
 body {

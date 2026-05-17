@@ -630,6 +630,91 @@ function useSettings(baseUrl: string): UseSettings {
   );
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Theme application — resolves "light" | "dark" | "system" → the active
+// scheme and writes [data-theme] on <html>. The FOUC script in layout.tsx
+// reads the same localStorage mirror before first paint; this hook keeps
+// it fresh when the user picks something different or the OS scheme
+// flips while "system" is active. Mount once at the app root.
+// ────────────────────────────────────────────────────────────────────────────
+const THEME_STORAGE_KEY = "blitz.theme";
+
+function useResolvedTheme(pref: ThemePreference): "light" | "dark" {
+  // We need a stable initial value during SSR — defaulting to "light" is
+  // fine because the FOUC script has already corrected <html> by the
+  // time React paints. The first client render syncs us to reality.
+  const [systemDark, setSystemDark] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    setSystemDark(mq.matches);
+    if (pref !== "system") return; // only listen when it actually matters
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [pref]);
+  if (pref === "dark") return "dark";
+  if (pref === "light") return "light";
+  return systemDark ? "dark" : "light";
+}
+
+function useApplyTheme(pref: ThemePreference, hydrated: boolean): void {
+  const resolved = useResolvedTheme(pref);
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.documentElement.setAttribute("data-theme", resolved);
+    // Only mirror the user's *preference* (not the resolved value) so
+    // the boot script can re-resolve "system" against the OS on next
+    // load. Wait for settings hydration so a transient "system" default
+    // doesn't overwrite a real saved choice.
+    if (!hydrated) return;
+    try {
+      if (pref === "system") localStorage.removeItem(THEME_STORAGE_KEY);
+      else localStorage.setItem(THEME_STORAGE_KEY, pref);
+    } catch { /* localStorage may be blocked; FOUC is best-effort */ }
+  }, [resolved, pref, hydrated]);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tauri shell integration — fullscreen detection only.
+//
+// Drag-region behavior lives in the Rust shell's initialization_script
+// (must hook mousedown synchronously so AppKit can pick up the native
+// drag gesture; a React listener fires too late). Here we just listen
+// for resize events and stamp [data-fullscreen] on <html> so the
+// `tauri-windowed:` variant retracts the traffic-light strip when the
+// OS hides the traffic lights during native fullscreen.
+// ────────────────────────────────────────────────────────────────────────────
+function useTauriShell(): void {
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!("__TAURI_INTERNALS__" in window)) return;
+
+    let unlistenResize: (() => void) | null = null;
+    let cancelled = false;
+
+    (async () => {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      if (cancelled) return;
+      const w = getCurrentWindow();
+
+      const syncFullscreen = async () => {
+        try {
+          const fs = await w.isFullscreen();
+          document.documentElement.toggleAttribute("data-fullscreen", fs);
+        } catch { /* ignore — Tauri may be tearing down */ }
+      };
+      await syncFullscreen();
+      unlistenResize = await w.onResized(() => { void syncFullscreen(); });
+    })();
+
+    return () => {
+      cancelled = true;
+      if (unlistenResize) unlistenResize();
+    };
+  }, []);
+}
+
 function mergeSettings(prev: SettingsShape, updates: Partial<SettingsShape>): SettingsShape {
   const out: SettingsShape = { ...prev };
   for (const [cat, vals] of Object.entries(updates) as Array<[keyof SettingsShape, Record<string, unknown>]>) {
@@ -782,6 +867,8 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
   const initiatives = useInitiatives(baseUrl);
   const atlassianCreds = useAtlassianCreds(baseUrl);
   const userSettings = useSettings(baseUrl);
+  useApplyTheme(userSettings.theme, userSettings.hydrated);
+  useTauriShell();
 
   // One persistent multiplexed stream for the whole app. Sessions are
   // spawned via /app/workspaces/{id}/sessions (server-side), but show up
@@ -899,7 +986,6 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
         onSelect={(id) => setActiveWorkspaceId(id)}
         onOpenCreate={() => setCreateModalOpen(true)}
         onOpenInitiatives={() => setInitiativeModalOpen(true)}
-        onOpenCreds={() => setCredsModalOpen(true)}
         onOpenArchive={() => setArchiveModalOpen(true)}
         onOpenSettings={() => setSettingsModalOpen(true)}
         onArchive={workspaces.archive}
@@ -980,6 +1066,7 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
           <Modal key="settings">
             <SettingsModal
               settings={userSettings}
+              creds={atlassianCreds}
               onClose={() => setSettingsModalOpen(false)}
             />
           </Modal>
@@ -1005,7 +1092,7 @@ function NoActiveWorkspace({ onCreate, creating }: { onCreate: () => void; creat
         disabled={creating}
         whileTap={{ scale: 0.97 }}
         transition={{ duration: 0.12, ease: EASE_OUT }}
-        className="mt-6 px-4 py-2 rounded-md text-[14px] font-medium text-white disabled:opacity-40 transition-opacity"
+        className="mt-6 px-4 py-2 rounded-md text-[14px] font-medium text-canvas disabled:opacity-40 transition-opacity"
         style={{ background: "var(--ink)" }}
       >
         {creating ? "Creating…" : "Add ticket"}
@@ -1587,16 +1674,19 @@ function DocChrome({
       transition={{ duration: 0.24, ease: EASE_OUT }}
       className="shrink-0 border-l border-line bg-canvas overflow-hidden flex flex-col min-h-0"
     >
-      <div className="px-4 py-3 border-b border-line flex items-start justify-between gap-3 shrink-0">
-        <div className="min-w-0">
-          <div className="flex items-baseline gap-2">
+      <div
+        className="px-4 py-3 border-b border-line flex items-start justify-between gap-3 shrink-0"
+        data-tauri-drag-region
+      >
+        <div className="min-w-0" data-tauri-drag-region>
+          <div className="flex items-baseline gap-2" data-tauri-drag-region>
             <span className="text-[10px] uppercase tracking-[0.14em] font-mono" style={{ color: accent }}>
               {kind}
             </span>
             {subtitle && <span className="text-[10px] font-mono text-ink-faint truncate">{subtitle}</span>}
           </div>
-          <div className="text-[14px] text-ink mt-0.5 truncate">{title}</div>
-          {meta && <div className="mt-0.5 text-[10px] text-ink-faint flex items-center gap-2">{meta}</div>}
+          <div className="text-[14px] text-ink mt-0.5 truncate" data-tauri-drag-region>{title}</div>
+          {meta && <div className="mt-0.5 text-[10px] text-ink-faint flex items-center gap-2" data-tauri-drag-region>{meta}</div>}
         </div>
         <div className="flex items-center gap-1 shrink-0">
           {externalUrl && (
@@ -1641,7 +1731,9 @@ const PROSE_CLASSES =
   "prose-code:text-ink prose-code:bg-surface-sunk prose-code:px-1 prose-code:py-0.5 prose-code:rounded " +
   "prose-code:before:hidden prose-code:after:hidden " +
   "prose-a:text-[color:var(--accent-cool)] prose-a:no-underline hover:prose-a:underline " +
-  "prose-pre:bg-surface-sunk prose-pre:border prose-pre:border-line";
+  "prose-pre:bg-surface-sunk prose-pre:border prose-pre:border-line " +
+  "prose-th:text-ink prose-td:text-ink-soft prose-th:border-line prose-td:border-line " +
+  "prose-blockquote:text-ink-soft prose-hr:border-line";
 
 // ────────────────────────────────────────────────────────────────────────────
 // TicketViewer — fetches /app/workflow/ticket-meta + the full /ticket
@@ -2214,7 +2306,8 @@ function PlanSidebar({
               prose-code:text-ink prose-code:bg-surface-sunk prose-code:px-1 prose-code:py-0.5 prose-code:rounded
               prose-code:before:hidden prose-code:after:hidden
               prose-a:text-[color:var(--accent-cool)] prose-a:no-underline hover:prose-a:underline
-              prose-pre:bg-surface-sunk prose-pre:border prose-pre:border-line"
+              prose-pre:bg-surface-sunk prose-pre:border prose-pre:border-line
+              prose-th:text-ink prose-td:text-ink-soft prose-blockquote:text-ink-soft"
           >
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan}</ReactMarkdown>
           </div>
@@ -2236,7 +2329,7 @@ function PlanSidebar({
             onClick={onApprove}
             whileTap={{ scale: 0.97 }}
             transition={{ duration: 0.12, ease: EASE_OUT }}
-            className="px-3 py-1.5 rounded-md text-[12px] font-medium text-white transition-opacity"
+            className="px-3 py-1.5 rounded-md text-[12px] font-medium text-canvas transition-opacity"
             style={{ background: "var(--ink)" }}
           >
             Approve & run
@@ -2374,7 +2467,7 @@ function Sidebar({
           disabled={creating}
           whileTap={{ scale: 0.97 }}
           transition={{ duration: 0.12, ease: EASE_OUT }}
-          className="w-full px-3 py-1.5 rounded-md text-[13px] font-medium text-white disabled:opacity-40 transition-opacity flex items-center justify-center gap-1.5"
+          className="w-full px-3 py-1.5 rounded-md text-[13px] font-medium text-canvas disabled:opacity-40 transition-opacity flex items-center justify-center gap-1.5"
           style={{ background: "var(--ink)" }}
         >
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden>
@@ -2621,7 +2714,6 @@ function TicketSidebar({
   onSelect,
   onOpenCreate,
   onOpenInitiatives,
-  onOpenCreds,
   onOpenArchive,
   onOpenSettings,
   onArchive,
@@ -2638,7 +2730,6 @@ function TicketSidebar({
   onSelect: (id: string) => void;
   onOpenCreate: () => void;
   onOpenInitiatives: () => void;
-  onOpenCreds: () => void;
   onOpenArchive: () => void;
   onOpenSettings: () => void;
   onArchive: (id: string) => Promise<void>;
@@ -2675,6 +2766,14 @@ function TicketSidebar({
 
   return (
     <aside className="w-[280px] shrink-0 border-r border-line bg-canvas flex flex-col">
+      {/* Title-bar strip — only present in the Tauri shell when the
+          window is not in fullscreen. Acts as the native title-bar
+          handle: drag to move, double-click to zoom. The drag is
+          wired by useTauriShell(); this attribute is just the marker. */}
+      <div
+        className="hidden tauri-windowed:block h-7 shrink-0"
+        data-tauri-drag-region
+      />
       <div className="px-4 py-4 border-b border-line">
         <div className="flex items-baseline gap-2 mb-3">
           <span className="font-serif text-xl leading-none italic tracking-tight">
@@ -2689,8 +2788,7 @@ function TicketSidebar({
           onClick={onOpenCreate}
           whileTap={{ scale: 0.97 }}
           transition={{ duration: 0.12, ease: EASE_OUT }}
-          className="w-full px-3 py-1.5 rounded-md text-[13px] font-medium text-white transition-opacity flex items-center justify-center gap-1.5"
-          style={{ background: "var(--ink)" }}
+          className="w-full px-3 py-1.5 rounded-md text-[13px] font-medium bg-ink text-canvas dark:bg-surface-tinted dark:text-ink-soft dark:hover:text-ink dark:border dark:border-line transition-colors flex items-center justify-center gap-1.5"
         >
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden>
             <path d="M5 1V9M1 5H9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
@@ -2744,31 +2842,23 @@ function TicketSidebar({
           />
         </div>
         <div className="flex items-center gap-0.5 shrink-0">
-          <SidebarUtilButton
-            onClick={onOpenCreds}
-            label={atlassianMeta.has_creds ? "Atlassian" : "Connect Atlassian"}
-            title={atlassianMeta.has_creds ? atlassianMeta.site_url ?? "Atlassian" : "Connect Atlassian to enable JIRA/Confluence"}
-            leadingDotColor={atlassianMeta.has_creds ? "var(--accent-ok)" : "var(--accent-warn)"}
-            tone={atlassianMeta.has_creds ? "default" : "warn"}
-          />
           <motion.button
             type="button"
             onClick={onOpenSettings}
             whileTap={{ scale: 0.94 }}
             transition={{ duration: 0.1, ease: EASE_OUT }}
-            title="Settings"
+            title={atlassianMeta.has_creds ? "Settings" : "Settings — Atlassian not connected"}
             aria-label="Open settings"
-            className="inline-flex items-center justify-center size-7 rounded-md text-ink-faint hover:text-ink hover:bg-surface-sunk transition-[color,background-color] duration-100 ease-out"
+            className="relative inline-flex items-center justify-center size-7 rounded-md text-ink-faint hover:text-ink hover:bg-surface-sunk transition-[color,background-color] duration-100 ease-out"
           >
-            <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden>
-              <circle cx="6.5" cy="6.5" r="1.8" stroke="currentColor" strokeWidth="1.2" />
-              <path
-                d="M6.5 1.5v1.6M6.5 9.9v1.6M11.5 6.5h-1.6M3.1 6.5H1.5M10.04 2.96l-1.13 1.13M4.09 8.91l-1.13 1.13M10.04 10.04l-1.13-1.13M4.09 4.09L2.96 2.96"
-                stroke="currentColor"
-                strokeWidth="1.2"
-                strokeLinecap="round"
+            <CogIcon />
+            {!atlassianMeta.has_creds && (
+              <span
+                className="absolute top-0.5 right-0.5 size-1.5 rounded-full"
+                style={{ background: "var(--accent-warn)" }}
+                aria-hidden
               />
-            </svg>
+            )}
           </motion.button>
         </div>
       </div>
@@ -3162,7 +3252,7 @@ function WorkspaceCreateModal({
           disabled={!canCreate}
           whileTap={canCreate ? { scale: 0.97 } : undefined}
           transition={{ duration: 0.12, ease: EASE_OUT }}
-          className="px-3 py-1.5 rounded-md text-[12px] font-medium text-white disabled:opacity-40 transition-opacity"
+          className="px-3 py-1.5 rounded-md text-[12px] font-medium text-canvas disabled:opacity-40 transition-opacity"
           style={{ background: "var(--ink)" }}
         >
           {creating ? "Creating…" : "Create workspace"}
@@ -3286,7 +3376,7 @@ function CredsModal({ creds, onClose }: { creds: UseAtlassianCreds; onClose: () 
             disabled={saving || !siteUrl.trim() || !email.trim() || (!creds.meta.has_creds && !token.trim())}
             whileTap={{ scale: 0.97 }}
             transition={{ duration: 0.12, ease: EASE_OUT }}
-            className="px-3 py-1.5 rounded-md text-[12px] font-medium text-white disabled:opacity-40 transition-opacity"
+            className="px-3 py-1.5 rounded-md text-[12px] font-medium text-canvas disabled:opacity-40 transition-opacity"
             style={{ background: "var(--ink)" }}
           >
             {saving ? "Saving…" : "Save"}
@@ -3901,22 +3991,27 @@ function ArchiveModal({
 // before the round-trip so toggles feel instant.
 // ────────────────────────────────────────────────────────────────────────────
 
-type SettingsCategory = "appearance";
+type SettingsCategory = "appearance" | "atlassian";
 
 const SETTINGS_CATEGORIES: { key: SettingsCategory; label: string; description: string }[] = [
   { key: "appearance", label: "Appearance", description: "Theme, density, typography" },
+  { key: "atlassian", label: "Atlassian", description: "JIRA + Confluence credentials" },
   // Future: { key: "workspaces", label: "Workspaces", description: "Defaults for new tickets" },
   // Future: { key: "agent", label: "Agent", description: "Permission mode defaults, model" },
 ];
 
 function SettingsModal({
   settings,
+  creds,
+  initialCategory,
   onClose,
 }: {
   settings: UseSettings;
+  creds: UseAtlassianCreds;
+  initialCategory?: SettingsCategory;
   onClose: () => void;
 }) {
-  const [active, setActive] = useState<SettingsCategory>("appearance");
+  const [active, setActive] = useState<SettingsCategory>(initialCategory ?? "appearance");
   return (
     <div
       className="bg-canvas border border-line rounded-xl shadow-xl overflow-hidden flex flex-col"
@@ -3939,28 +4034,48 @@ function SettingsModal({
         {/* Left pane: categories */}
         <nav className="w-[200px] shrink-0 border-r border-line bg-surface-sunk/40 overflow-y-auto scroll-quiet py-2">
           <ul className="space-y-px px-1.5">
-            {SETTINGS_CATEGORIES.map((c) => (
-              <li key={c.key}>
-                <button
-                  type="button"
-                  onClick={() => setActive(c.key)}
-                  className={`w-full text-left px-3 py-2 rounded-md transition-colors duration-100 ease-out ${
-                    active === c.key
-                      ? "bg-surface-tinted text-ink"
-                      : "text-ink-soft hover:text-ink hover:bg-surface-sunk"
-                  }`}
-                >
-                  <div className="text-[13px]">{c.label}</div>
-                  <div className="text-[10px] text-ink-faint mt-0.5 truncate">{c.description}</div>
-                </button>
-              </li>
-            ))}
+            {SETTINGS_CATEGORIES.map((c) => {
+              const dot =
+                c.key === "atlassian"
+                  ? creds.meta.has_creds
+                    ? "var(--accent-ok)"
+                    : "var(--accent-warn)"
+                  : null;
+              return (
+                <li key={c.key}>
+                  <button
+                    type="button"
+                    onClick={() => setActive(c.key)}
+                    className={`w-full text-left px-3 py-2 rounded-md transition-colors duration-100 ease-out ${
+                      active === c.key
+                        ? "bg-surface-tinted text-ink"
+                        : "text-ink-soft hover:text-ink hover:bg-surface-sunk"
+                    }`}
+                  >
+                    <div className="text-[13px] flex items-center gap-1.5">
+                      {dot && (
+                        <span
+                          className="inline-block size-1.5 rounded-full shrink-0"
+                          style={{ background: dot }}
+                          aria-hidden
+                        />
+                      )}
+                      {c.label}
+                    </div>
+                    <div className="text-[10px] text-ink-faint mt-0.5 truncate">{c.description}</div>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </nav>
         {/* Right pane: content */}
         <div className="flex-1 min-w-0 overflow-y-auto scroll-quiet px-6 py-6">
           {active === "appearance" && (
             <AppearanceSettings settings={settings} />
+          )}
+          {active === "atlassian" && (
+            <AtlassianSettings creds={creds} />
           )}
         </div>
       </div>
@@ -3991,6 +4106,191 @@ function AppearanceSettings({ settings }: { settings: UseSettings }) {
         </SettingRow>
       </div>
     </section>
+  );
+}
+
+function AtlassianSettings({ creds }: { creds: UseAtlassianCreds }) {
+  const [siteUrl, setSiteUrl] = useState(creds.meta.site_url ?? "");
+  const [email, setEmail] = useState(creds.meta.email ?? "");
+  const [token, setToken] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [forgetting, setForgetting] = useState(false);
+
+  // Re-sync when the hook's meta refreshes after a save/clear elsewhere.
+  useEffect(() => {
+    setSiteUrl(creds.meta.site_url ?? "");
+    setEmail(creds.meta.email ?? "");
+  }, [creds.meta.site_url, creds.meta.email]);
+
+  const dirty =
+    siteUrl.trim() !== (creds.meta.site_url ?? "") ||
+    email.trim() !== (creds.meta.email ?? "") ||
+    token.trim().length > 0;
+  const canSave =
+    !saving &&
+    dirty &&
+    siteUrl.trim().length > 0 &&
+    email.trim().length > 0 &&
+    (creds.meta.has_creds || token.trim().length > 0);
+
+  const submit = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await creds.set({ site_url: siteUrl.trim(), email: email.trim(), api_token: token });
+      setToken("");
+      setSavedAt(Date.now());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const forget = async () => {
+    setForgetting(true);
+    try {
+      await creds.clear();
+      setSiteUrl("");
+      setEmail("");
+      setToken("");
+    } finally {
+      setForgetting(false);
+    }
+  };
+
+  return (
+    <section>
+      <div className="flex items-baseline justify-between gap-4">
+        <div>
+          <h2 className="font-serif text-2xl text-ink leading-tight tracking-tight">Atlassian</h2>
+          <p className="mt-1 text-[13px] text-ink-muted">
+            Powers ticket typeahead, JIRA reads/writes, and Confluence RFC/debrief writes.
+          </p>
+        </div>
+        <ConnectionPill connected={creds.meta.has_creds} />
+      </div>
+
+      <div className="mt-6 space-y-4">
+        <FieldRow label="Site URL">
+          <input
+            type="text"
+            value={siteUrl}
+            onChange={(e) => setSiteUrl(e.target.value)}
+            placeholder="https://your-site.atlassian.net"
+            className="w-full px-3 py-2 rounded-md border border-line bg-surface text-ink font-mono text-[13px] focus:outline-none focus:border-line-strong"
+          />
+        </FieldRow>
+        <FieldRow label="Email">
+          <input
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="you@example.com"
+            className="w-full px-3 py-2 rounded-md border border-line bg-surface text-ink text-[13px] focus:outline-none focus:border-line-strong"
+          />
+        </FieldRow>
+        <FieldRow
+          label="API token"
+          hint={
+            <>
+              Stored locally (chmod 0600), never sent anywhere else.{" "}
+              <a
+                href="https://id.atlassian.com/manage-profile/security/api-tokens"
+                target="_blank"
+                rel="noreferrer"
+                className="text-[color:var(--accent-cool)] hover:underline"
+              >
+                Generate one ↗
+              </a>
+            </>
+          }
+        >
+          <input
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder={creds.meta.has_creds ? "(unchanged — type to replace)" : "atlassian API token"}
+            className="w-full px-3 py-2 rounded-md border border-line bg-surface text-ink font-mono text-[13px] focus:outline-none focus:border-line-strong"
+          />
+        </FieldRow>
+      </div>
+
+      {error && (
+        <div className="mt-4 px-3 py-2 rounded-md bg-[color:var(--tint-err)] text-[color:var(--accent-err)] text-[12px] font-mono">
+          {error}
+        </div>
+      )}
+
+      <div className="mt-6 flex items-center justify-between gap-2">
+        <div className="text-[11px] text-ink-faint">
+          {savedAt && !dirty ? "Saved." : creds.meta.has_creds ? "Connected." : "Not connected."}
+        </div>
+        <div className="flex items-center gap-2">
+          {creds.meta.has_creds && (
+            <button
+              type="button"
+              onClick={() => { if (confirm("Forget Atlassian credentials?")) void forget(); }}
+              disabled={forgetting}
+              className="px-3 py-1.5 rounded-md text-[12px] text-[color:var(--accent-err)] hover:bg-[color:var(--tint-err)] transition-colors disabled:opacity-40"
+            >
+              {forgetting ? "Forgetting…" : "Forget creds"}
+            </button>
+          )}
+          <motion.button
+            type="button"
+            onClick={() => void submit()}
+            disabled={!canSave}
+            whileTap={{ scale: 0.97 }}
+            transition={{ duration: 0.12, ease: EASE_OUT }}
+            className="px-3 py-1.5 rounded-md text-[12px] font-medium bg-ink text-canvas dark:bg-surface-tinted dark:text-ink-soft dark:hover:text-ink dark:border dark:border-line transition-colors disabled:opacity-40"
+          >
+            {saving ? "Saving…" : "Save"}
+          </motion.button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ConnectionPill({ connected }: { connected: boolean }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-[0.14em] ${
+        connected
+          ? "bg-[color:var(--tint-ok)] text-[color:var(--accent-ok)]"
+          : "bg-[color:var(--tint-warn)] text-[color:var(--accent-warn)]"
+      }`}
+    >
+      <span
+        className="inline-block size-1.5 rounded-full"
+        style={{ background: connected ? "var(--accent-ok)" : "var(--accent-warn)" }}
+        aria-hidden
+      />
+      {connected ? "Connected" : "Not connected"}
+    </span>
+  );
+}
+
+function FieldRow({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="block">
+      <span className="block text-[11px] font-mono uppercase tracking-[0.14em] text-ink-faint mb-1.5">
+        {label}
+      </span>
+      {children}
+      {hint && <span className="block mt-1.5 text-[11px] text-ink-faint leading-relaxed">{hint}</span>}
+    </label>
   );
 }
 
@@ -4216,7 +4516,7 @@ function InitiativeManager({
             monoValue
           />
           {error && <div className="text-[11px] text-[color:var(--accent-err)] font-mono">{error}</div>}
-          <button type="button" onClick={submit} disabled={!key.trim()} className="px-3 py-1.5 rounded-md text-[12px] font-medium text-white disabled:opacity-40" style={{ background: "var(--ink)" }}>
+          <button type="button" onClick={submit} disabled={!key.trim()} className="px-3 py-1.5 rounded-md text-[12px] font-medium text-canvas disabled:opacity-40" style={{ background: "var(--ink)" }}>
             Save initiative
           </button>
         </div>
@@ -4270,7 +4570,7 @@ function NoActiveSession({
         disabled={creating}
         whileTap={{ scale: 0.97 }}
         transition={{ duration: 0.12, ease: EASE_OUT }}
-        className="mt-6 px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-40"
+        className="mt-6 px-4 py-2 rounded-md text-sm font-medium text-canvas disabled:opacity-40"
         style={{ background: "var(--ink)" }}
       >
         {creating ? "Creating…" : "New session"}
@@ -4315,8 +4615,14 @@ function Header({
   onDeleteSession?: (sid: string) => Promise<void>;
 }) {
   return (
-    <header className="border-b border-line bg-canvas/80 backdrop-blur-sm">
-      <div className="mx-auto w-full max-w-2xl px-6 h-14 flex items-center justify-between gap-4">
+    <header
+      className="border-b border-line bg-canvas/80 backdrop-blur-sm"
+      data-tauri-drag-region
+    >
+      <div
+        className="mx-auto w-full max-w-2xl px-6 h-14 flex items-center justify-between gap-4"
+        data-tauri-drag-region
+      >
         <div className="flex items-center gap-3 min-w-0 flex-1">
           {workspace && (
             <div className="flex items-baseline gap-2 shrink-0">
@@ -4711,6 +5017,26 @@ function MenuItem({
   );
 }
 
+function CogIcon() {
+  // 8-tooth cog, axis-aligned + diagonal teeth, inner ring. Stroke-only
+  // so it inherits currentColor and stays crisp at 14px.
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"
+        stroke="currentColor"
+        strokeWidth="1.4"
+      />
+      <path
+        d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function IconPencil() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden>
@@ -4921,7 +5247,7 @@ function PermissionModeMenu({
         transition={{ duration: 0.12, ease: EASE_OUT }}
         className={`flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.18em] px-2 py-0.5 rounded border transition-colors ${
           isAttention
-            ? "border-transparent text-white"
+            ? "border-transparent text-[#fff]"
             : "border-line text-ink-soft hover:border-line-strong"
         }`}
         style={isAttention ? { background: dot } : undefined}
@@ -5073,8 +5399,8 @@ function AssistantText({ text, streaming }: { text: string; streaming: boolean }
           prose-blockquote:border-l-2 prose-blockquote:border-[color:var(--line-strong)] prose-blockquote:not-italic prose-blockquote:text-ink-soft
           prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-li:marker:text-ink-faint
           prose-hr:border-[color:var(--line)]
-          prose-table:border-collapse prose-th:border prose-th:border-[color:var(--line)] prose-th:px-3 prose-th:py-1.5 prose-th:bg-[color:var(--surface-sunk)] prose-th:text-left
-          prose-td:border prose-td:border-[color:var(--line)] prose-td:px-3 prose-td:py-1.5
+          prose-table:border-collapse prose-th:border prose-th:border-[color:var(--line)] prose-th:px-3 prose-th:py-1.5 prose-th:bg-[color:var(--surface-sunk)] prose-th:text-left prose-th:text-ink
+          prose-td:border prose-td:border-[color:var(--line)] prose-td:px-3 prose-td:py-1.5 prose-td:text-ink-soft
         `}
       >
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
@@ -5671,7 +5997,7 @@ function FolderPicker({
           onClick={() => pickedPath && onPick(pickedPath)}
           whileTap={{ scale: 0.97 }}
           transition={{ duration: 0.12, ease: EASE_OUT }}
-          className="px-3 py-1.5 rounded-md text-[12px] font-medium text-white disabled:opacity-40 transition-opacity"
+          className="px-3 py-1.5 rounded-md text-[12px] font-medium text-canvas disabled:opacity-40 transition-opacity"
           style={{ background: "var(--ink)" }}
         >
           {confirmLabel}
@@ -6350,7 +6676,7 @@ function PrimaryButton({
       disabled={disabled}
       whileTap={{ scale: 0.97 }}
       transition={{ duration: 0.12, ease: EASE_OUT }}
-      className="px-3.5 py-2 rounded-md text-[13px] font-medium text-white disabled:opacity-40 transition-opacity"
+      className="px-3.5 py-2 rounded-md text-[13px] font-medium text-canvas disabled:opacity-40 transition-opacity"
       style={{ background: bg }}
     >
       {children}
@@ -6806,7 +7132,7 @@ function SendButton({ onClick, disabled }: { onClick: () => void; disabled: bool
       disabled={disabled}
       whileTap={{ scale: 0.94 }}
       transition={{ duration: 0.12, ease: EASE_OUT }}
-      className="size-9 rounded-lg flex items-center justify-center text-white disabled:opacity-30 transition-opacity"
+      className="size-9 rounded-lg flex items-center justify-center text-canvas disabled:opacity-30 transition-opacity"
       style={{ background: "var(--ink)" }}
       aria-label="Send"
     >

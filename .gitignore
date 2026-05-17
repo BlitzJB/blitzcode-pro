@@ -36,3 +36,9 @@ coverage/
 
 # Tooling caches
 .agents/
+
+# Tauri / Rust
+target/
+apps/desktop/src-tauri/gen/
+*.app
+*.dmg

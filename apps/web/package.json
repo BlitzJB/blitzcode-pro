@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --port 51821",
     "build": "next build",
-    "start": "next start",
+    "start": "next start --port 51821",
     "lint": "eslint",
     "test": "vitest run"
   },
@@ -13,6 +13,7 @@
     "@agent-webkit/core": "workspace:*",
     "@agent-webkit/react": "workspace:*",
     "@tailwindcss/typography": "^0.5.19",
+    "@tauri-apps/api": "^2",
     "framer-motion": "^12.38.0",
     "next": "16.2.6",
     "react": "19.2.4",

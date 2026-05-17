@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0.0",
+  "productName": "blitzcode",
+  "version": "0.1.0",
+  "identifier": "dev.blitzcode.pro",
+  "build": {
+    "frontendDist": "../../web/out"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "DeveloperTool",
+    "shortDescription": "Workflow-aware Claude Code shell.",
+    "longDescription": "blitzcode-pro: a ticket-first agent harness with JIRA + Confluence integration, running fully on-device.",
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}

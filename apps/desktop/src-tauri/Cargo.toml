@@ -1,0 +1,21 @@
+[package]
+name = "blitzcode-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Native macOS shell for blitzcode-pro."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+anyhow = "1"
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Smaller release binary — we don't need debuginfo in the shipped .app.
+[profile.release]
+strip = true
+lto = true
+opt-level = "s"
+codegen-units = 1
