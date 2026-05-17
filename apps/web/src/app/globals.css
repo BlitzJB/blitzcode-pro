@@ -1,0 +1,131 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Design tokens — warm-bone canvas, tinted neutrals, restrained accents.
+   Light mode only (no @media dark override) — this is a daylight tool.
+   ──────────────────────────────────────────────────────────────────────────── */
+:root {
+  /* Surfaces */
+  --canvas: #fbfbfa;          /* page background (warm bone) */
+  --surface: #ffffff;         /* cards / input bar */
+  --surface-sunk: #f7f6f3;    /* tool result code blocks, kbd */
+  --surface-tinted: #f3f2ee;  /* user bubble */
+
+  /* Text */
+  --ink: #1a1a19;             /* primary */
+  --ink-soft: #4a4946;        /* secondary body */
+  --ink-muted: #6b6a66;       /* meta / labels */
+  --ink-faint: #9a998f;       /* timestamps, faint icons */
+
+  /* Lines */
+  --line: #eaeae7;            /* borders, dividers */
+  --line-strong: #d8d7d2;     /* hover / focus borders */
+
+  /* Accents — muted, semantic only */
+  --accent-warm: #b14a2e;     /* assistant turn marker (terra) */
+  --accent-cool: #1f6c9f;     /* permission / info */
+  --accent-purple: #6b4eb0;   /* question */
+  --accent-ok: #346538;       /* tool success */
+  --accent-warn: #956400;     /* awaiting */
+  --accent-err: #9f2f2d;      /* error */
+
+  /* Tints (matched to accents) */
+  --tint-cool: #e7f1fa;
+  --tint-purple: #ece8f7;
+  --tint-ok: #edf3ec;
+  --tint-warn: #fbf3db;
+  --tint-err: #fdebec;
+
+  /* Easing — strong curves per Emil's spec */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-sunk: var(--surface-sunk);
+  --color-surface-tinted: var(--surface-tinted);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent-warm: var(--accent-warm);
+  --color-accent-cool: var(--accent-cool);
+  --color-accent-purple: var(--accent-purple);
+  --color-accent-ok: var(--accent-ok);
+  --color-accent-warn: var(--accent-warn);
+  --color-accent-err: var(--accent-err);
+  --color-tint-cool: var(--tint-cool);
+  --color-tint-purple: var(--tint-purple);
+  --color-tint-ok: var(--tint-ok);
+  --color-tint-warn: var(--tint-warn);
+  --color-tint-err: var(--tint-err);
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+  --font-serif: var(--font-serif);
+}
+
+html, body {
+  background: var(--canvas);
+  color: var(--ink);
+  color-scheme: light;
+}
+
+body {
+  font-family: var(--font-sans), system-ui, sans-serif;
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom selection */
+::selection {
+  background: var(--tint-warn);
+  color: var(--ink);
+}
+
+/* Reduced motion respect */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+/* Streaming caret */
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+.stream-caret {
+  display: inline-block;
+  width: 0.45em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--accent-warm);
+  animation: blink 1.1s steps(2, end) infinite;
+}
+
+/* Status dot pulse */
+@keyframes pulseDot {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.4); opacity: 0.5; }
+}
+.dot-pulse {
+  animation: pulseDot 1.4s var(--ease-in-out) infinite;
+}
+
+/* Scrollbar — quiet, but visible */
+.scroll-quiet {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+.scroll-quiet::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-quiet::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
+.scroll-quiet::-webkit-scrollbar-track { background: transparent; }

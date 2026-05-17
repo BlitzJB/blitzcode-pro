@@ -1,0 +1,9 @@
+{
+  "name": "blitzcode",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev:web": "pnpm --filter @blitzcode/web dev",
+    "dev:server": "cd apps/server && uv run python main.py"
+  }
+}

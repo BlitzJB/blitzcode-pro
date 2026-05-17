@@ -1,0 +1,23 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = [
+    "--cov=packages/agent-webkit-server/src/agent_webkit_server",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90",
+]
+testpaths = ["tests/unit", "tests/contract", "tests/properties"]
+
+[tool.coverage.run]
+branch = false
+source = ["packages/agent-webkit-server/src/agent_webkit_server"]
+# Adapters depend on optional extras (asyncpg, fastapi) and are exercised by
+# tier-2 integration tests with real services, not the always-on unit gate.
+omit = ["packages/agent-webkit-server/src/agent_webkit_server/adapters/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

@@ -1,0 +1,59 @@
+{
+  "name": "@agent-webkit/core",
+  "version": "0.2.0",
+  "description": "L1 vanilla JS SDK for the agent-webkit wire protocol. Isomorphic (browser/Node/Deno/Bun).",
+  "license": "MIT",
+  "author": "BlitzJB",
+  "homepage": "https://github.com/BlitzJB/agent-webkit#readme",
+  "bugs": {
+    "url": "https://github.com/BlitzJB/agent-webkit/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BlitzJB/agent-webkit.git",
+    "directory": "packages/core"
+  },
+  "keywords": [
+    "claude",
+    "agent-sdk",
+    "sse",
+    "anthropic",
+    "agent"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./genui": {
+      "types": "./dist/genui/index.d.ts",
+      "import": "./dist/genui/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  },
+  "sideEffects": false
+}

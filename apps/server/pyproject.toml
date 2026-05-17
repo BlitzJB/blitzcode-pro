@@ -1,0 +1,20 @@
+[project]
+name = "server"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "agent-webkit-server[fastapi]",
+    "uvicorn>=0.47.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv.sources]
+agent-webkit-server = { path = "../../packages/agent-webkit/packages/agent-webkit-server", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

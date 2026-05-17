@@ -1,0 +1,38 @@
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.hypothesis/
+
+# Next.js
+.next/
+out/
+
+# Editors / OS
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+
+# Logs
+*.log
+
+# Coverage
+.coverage
+coverage/
+
+# Misc
+.turbo/
+
+# Tooling caches
+.agents/
