@@ -165,16 +165,12 @@ app = create_app(
 
 # CORS — only needed in dev where the Next dev server sits on a different
 # port. The bundled .app serves frontend + API from the same origin so
-# the middleware becomes a no-op there. Dev ports are non-standard
-# (51820/51821) to avoid colliding with the long tail of other tools
-# that grab 3000/8000.
-_DEV_WEB_ORIGINS = [
-    "http://localhost:51821",
-    "http://127.0.0.1:51821",
-]
+# the middleware becomes a no-op there. Tauri dev also runs on an ephemeral
+# port, so allow all localhost origins.
+_DEV_WEB_ORIGINS = ["http://localhost:*", "http://127.0.0.1:*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_DEV_WEB_ORIGINS,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
