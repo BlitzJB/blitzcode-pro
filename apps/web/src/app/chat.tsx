@@ -772,7 +772,8 @@ export interface TicketSearchResult {
 
 async function searchTickets(baseUrl: string, q: string, signal?: AbortSignal): Promise<TicketSearchResult[]> {
   if (!q.trim()) return [];
-  const url = new URL(`${baseUrl}/app/workflow/search-tickets`);
+  const base = baseUrl || "";
+  const url = new URL(`${base}/app/workflow/search-tickets`, window.location.origin);
   url.searchParams.set("q", q);
   const r = await fetch(url.toString(), { signal });
   if (!r.ok) {
@@ -3734,7 +3735,8 @@ interface ConfluencePageResult { id: string; title: string; url: string | null }
 
 async function searchConfluencePages(baseUrl: string, q: string, signal?: AbortSignal): Promise<ConfluencePageResult[]> {
   if (!q.trim()) return [];
-  const url = new URL(`${baseUrl}/app/workflow/search-pages`);
+  const base = baseUrl || "";
+  const url = new URL(`${base}/app/workflow/search-pages`, window.location.origin);
   url.searchParams.set("q", q);
   const r = await fetch(url.toString(), { signal });
   if (!r.ok) {
@@ -5853,7 +5855,8 @@ function FolderPicker({
 
   const fetchListing = useCallback(
     async (path?: string): Promise<FsListing> => {
-      const url = new URL(`${baseUrl}/app/fs/list`);
+      const base = baseUrl || "";
+      const url = new URL(`${base}/app/fs/list`, window.location.origin);
       if (path) url.searchParams.set("path", path);
       const r = await fetch(url.toString());
       if (!r.ok) {
