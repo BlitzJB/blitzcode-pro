@@ -1,15 +1,23 @@
+"use client";
+
+import { useEffect, useState } from "react";
 import Chat from "./chat";
 
-// In dev we run the API on a non-standard port (51820) and the Next dev
-// server on 51821, so fetches need an absolute base. In the bundled
-// .app, FastAPI serves both the API and this page from the same
-// ephemeral port — set NEXT_PUBLIC_AGENT_BASE_URL="" at build time so
-// the same code uses relative URLs and the origin resolves to whatever
-// port the Rust shell happened to pick.
-const DEFAULT_BASE_URL = "http://127.0.0.1:51820";
-
 export default function Home() {
-  const env = process.env.NEXT_PUBLIC_AGENT_BASE_URL;
-  const baseUrl = env === undefined ? DEFAULT_BASE_URL : env;
+  const [baseUrl, setBaseUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    const env = process.env.NEXT_PUBLIC_AGENT_BASE_URL;
+    if (env !== undefined) {
+      setBaseUrl(env);
+    } else {
+      // In bundled .app: FastAPI serves both API and this page from same port.
+      // Use window.location.origin for both. In dev: this runs on 51821 but API
+      // on ephemeral port, so use relative URLs ("") which will use the current origin.
+      setBaseUrl("");
+    }
+  }, []);
+
+  if (baseUrl === null) return null;
   return <Chat baseUrl={baseUrl} />;
 }
