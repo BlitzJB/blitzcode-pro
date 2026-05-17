@@ -2,30 +2,124 @@ import asyncio
 import contextlib
 import os
 from pathlib import Path
+from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from agent_webkit_server.adapters.fastapi import create_app
 from agent_webkit_server.auth import AuthConfig
+from agent_webkit_server.session import SessionConfig
 from agent_webkit_server.session_metadata import FileSessionMetadataStore
 
 from acks import AckStore
 from discovery import discover_for_cwd
 from builtin_agents import BUILTIN_AGENTS
-
-# Persistent session metadata (wrapper UUID ↔ SDK session id + config) lets
-# sessions survive uvicorn restarts and idle reaps. Transcript history is
-# replayed on resume by reading the SDK's authoritative on-disk transcript
-# (~/.claude/projects/<cwd>/<sdk-session>.jsonl) — we don't keep a second copy.
-_SESSIONS_DIR = Path(
-    os.environ.get("AGENT_WEBKIT_SESSIONS_DIR", str(Path.home() / ".agent-webkit" / "sessions"))
+from initiatives import Initiative, InitiativeStore, is_valid_key as is_valid_initiative_key
+from workspaces import (
+    DocRef,
+    RepoSpec,
+    Workspace,
+    WorkspaceRepo,
+    WorkspaceStore,
+    create_workspace,
+    delete_workspace,
+    is_valid_ticket_key,
 )
+from workflow_prompt import render_workflow_prompt
+from atlassian_creds import CredsStore
+from atlassian.jira import JiraClient, JiraError
+from atlassian.confluence import ConfluenceClient, ConfluenceError
+from settings import SettingsStore
+from workflow_mcp.workflow import (
+    ALLOWED_TOOL_PATTERNS as WORKFLOW_ALLOWED_TOOLS,
+    WorkflowDeps,
+    build_workflow_mcp_server,
+)
+import git_worktree as gw
+
+# ────────────────────────────────────────────────────────────────────────────
+# Paths — all blitzcode-pro state under one root so uninstall is `rm -rf`.
+# ────────────────────────────────────────────────────────────────────────────
+
+_AGENT_WEBKIT_ROOT = Path.home() / ".agent-webkit"
+_BLITZ_PRO_ROOT = Path(
+    os.environ.get("BLITZCODE_PRO_ROOT", str(_AGENT_WEBKIT_ROOT / "blitzcode-pro"))
+)
+_SESSIONS_DIR = Path(
+    os.environ.get("AGENT_WEBKIT_SESSIONS_DIR", str(_AGENT_WEBKIT_ROOT / "sessions"))
+)
+_WORKSPACES_ROOT = Path(
+    os.environ.get("BLITZCODE_PRO_WORKSPACES_ROOT", str(_BLITZ_PRO_ROOT / "workspaces"))
+)
+
 metadata_store = FileSessionMetadataStore(_SESSIONS_DIR)
+ack_store = AckStore(
+    Path(os.environ.get("BLITZ_ACKS_PATH", str(_AGENT_WEBKIT_ROOT / "app-acks.json")))
+)
+workspace_store = WorkspaceStore(_BLITZ_PRO_ROOT / "workspaces.json")
+initiative_store = InitiativeStore(_BLITZ_PRO_ROOT / "initiatives.json")
+creds_store = CredsStore(_BLITZ_PRO_ROOT / "atlassian-creds.json")
+settings_store = SettingsStore(_BLITZ_PRO_ROOT / "settings.json")
+
+# ────────────────────────────────────────────────────────────────────────────
+# Workflow prompt injection — called per session-creation by the SDK factory.
+# Sessions outside a workspace get the stock Claude Code preset; sessions
+# inside a workspace get an addendum with ticket + repo context.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _workflow_system_prompt_append(config: SessionConfig) -> Optional[str]:
+    if not config.workspace_id:
+        return None
+    ws = workspace_store.get(config.workspace_id)
+    if ws is None:
+        return None
+    initiative_name: Optional[str] = None
+    if ws.initiative_key:
+        initiative = initiative_store.get(ws.initiative_key)
+        if initiative is not None:
+            initiative_name = initiative.display_name
+    return render_workflow_prompt(ws, initiative_display_name=initiative_name)
+
+
+# Build the workflow MCP server lazily on first session that needs it. The
+# build closes over the real SDK import (claude_agent_sdk) which we don't
+# want to load at module import — keeps test fixtures + non-SDK
+# environments importing this module cleanly.
+_workflow_server_cache: dict = {}
+
+
+def _workflow_extra_mcp_servers(config: SessionConfig) -> Optional[dict[str, Any]]:
+    if not config.workspace_id:
+        return None
+    if "server" not in _workflow_server_cache:
+        try:
+            _workflow_server_cache["server"] = build_workflow_mcp_server(
+                WorkflowDeps(
+                    creds_store=creds_store,
+                    workspace_store=workspace_store,
+                    initiative_store=initiative_store,
+                )
+            )
+        except ImportError:  # pragma: no cover — claude_agent_sdk missing
+            return None
+    return {"workflow": _workflow_server_cache["server"]}
+
+
+def _workflow_extra_allowed_tools(config: SessionConfig) -> Optional[list[str]]:
+    if not config.workspace_id:
+        return None
+    return list(WORKFLOW_ALLOWED_TOOLS)
+
 
 app = create_app(
     auth=AuthConfig(disabled=True),
     metadata_store=metadata_store,
+    system_prompt_append=_workflow_system_prompt_append,
+    extra_mcp_servers=_workflow_extra_mcp_servers,
+    extra_allowed_tools=_workflow_extra_allowed_tools,
 )
 
 app.add_middleware(
@@ -37,19 +131,8 @@ app.add_middleware(
 )
 
 # ────────────────────────────────────────────────────────────────────────────
-# App-layer "needs input" tracking.
-#
-# Pure application concern — not part of agent-webkit. We subscribe to the
-# global event log via app.state.registry (exposed by create_app as a generic
-# extension hook) and stamp `last_completion_at` whenever an agent turn
-# finishes. The UI polls /app/state on mount and observes its own /stream for
-# live `result` events, computing `needs_input` client-side.
+# "Needs input" tracking — listens to result events on the global event log.
 # ────────────────────────────────────────────────────────────────────────────
-
-_ACKS_PATH = Path(
-    os.environ.get("BLITZ_ACKS_PATH", str(Path.home() / ".agent-webkit" / "app-acks.json"))
-)
-ack_store = AckStore(_ACKS_PATH)
 
 
 async def _watch_completions() -> None:
@@ -85,6 +168,11 @@ async def _chained_lifespan(app_: FastAPI):
 app.router.lifespan_context = _chained_lifespan
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Existing endpoints — acks, filesystem listing, completions
+# ────────────────────────────────────────────────────────────────────────────
+
+
 @app.get("/app/state")
 async def app_state() -> dict:
     snap = ack_store.snapshot()
@@ -101,12 +189,6 @@ async def app_state() -> dict:
 
 @app.get("/app/fs/list")
 async def fs_list(path: str | None = None) -> dict:
-    """Local filesystem directory listing for the in-app folder picker.
-
-    Browsers hide absolute paths from <input webkitdirectory> and
-    showDirectoryPicker for security, so the server (which runs on the
-    user's machine in this local-only dev tool) exposes the listing.
-    """
     target = Path(path).expanduser() if path else Path.home()
     try:
         target = target.resolve(strict=True)
@@ -139,17 +221,9 @@ async def fs_list(path: str | None = None) -> dict:
 
 @app.get("/app/sessions/{session_id}/completions")
 async def session_completions(session_id: str) -> dict:
-    """Completion items available to this session's `/` and `@` palettes.
-
-    Source of truth = filesystem under {cwd}/.claude/{commands,agents,skills}
-    and the corresponding ~/.claude dirs. Built-in agents come from
-    `claude agents` (cached at import). Project entries shadow user entries
-    with the same name.
-    """
     md = await metadata_store.load(session_id) if metadata_store is not None else None
     cwd = md.cwd if md is not None else None
     data = discover_for_cwd(cwd)
-    # Append built-in agents AFTER project + user, and only if not shadowed.
     seen_agent_names = {a["name"] for a in data["agents"]}
     for ba in BUILTIN_AGENTS:
         if ba["name"] not in seen_agent_names:
@@ -167,6 +241,488 @@ async def acknowledge(session_id: str) -> dict:
         "last_completion_at": entry.last_completion_at,
         "last_ack_at": entry.last_ack_at,
     }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Initiatives — friendly umbrellas (e.g. "meowtorq" → display "Meowtorq",
+# epic LLM-608, Confluence root page, list of repos). The agent uses these
+# to correlate "is this part of <initiative>?" questions at workspace-create.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class InitiativeIn(BaseModel):
+    key: str
+    display_name: str
+    epic_jira_key: Optional[str] = None
+    confluence_root_page_id: Optional[str] = None
+    repo_paths: list[str] = Field(default_factory=list)
+
+
+def _initiative_dict(it: Initiative) -> dict:
+    return {
+        "key": it.key,
+        "display_name": it.display_name,
+        "epic_jira_key": it.epic_jira_key,
+        "confluence_root_page_id": it.confluence_root_page_id,
+        "repo_paths": list(it.repo_paths),
+    }
+
+
+@app.get("/app/initiatives")
+async def list_initiatives() -> dict:
+    return {"initiatives": [_initiative_dict(it) for it in initiative_store.list()]}
+
+
+def _normalize_initiative_key(raw: str) -> str:
+    """Coerce a user-typed key into the canonical slug form.
+
+    Lowercases, swaps whitespace/underscores for dashes, drops anything
+    outside [a-z0-9-]. Reduces runs of dashes and trims leading/trailing.
+    """
+    import re as _re
+    s = (raw or "").strip().lower().replace("_", "-")
+    s = _re.sub(r"\s+", "-", s)
+    s = _re.sub(r"[^a-z0-9-]", "", s)
+    s = _re.sub(r"-+", "-", s).strip("-")
+    return s
+
+
+@app.post("/app/initiatives")
+async def create_initiative(body: InitiativeIn) -> dict:
+    key = _normalize_initiative_key(body.key)
+    if not is_valid_initiative_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one alphanumeric character for the key.",
+        )
+    it = Initiative(
+        key=key,
+        display_name=body.display_name or key,
+        epic_jira_key=body.epic_jira_key,
+        confluence_root_page_id=body.confluence_root_page_id,
+        repo_paths=list(body.repo_paths),
+    )
+    saved = await initiative_store.upsert(it)
+    return _initiative_dict(saved)
+
+
+class InitiativePatch(BaseModel):
+    display_name: Optional[str] = None
+    epic_jira_key: Optional[str] = None
+    confluence_root_page_id: Optional[str] = None
+    repo_paths: Optional[list[str]] = None
+
+
+@app.patch("/app/initiatives/{key}")
+async def patch_initiative(key: str, body: InitiativePatch) -> dict:
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    updated = await initiative_store.patch(key, **fields)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Initiative not found")
+    return _initiative_dict(updated)
+
+
+@app.delete("/app/initiatives/{key}")
+async def delete_initiative(key: str) -> dict:
+    ok = await initiative_store.remove(key)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Initiative not found")
+    return {"ok": True}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Workspaces — tickets + worktrees + sessions
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class RepoSpecIn(BaseModel):
+    source_path: str
+    branch: Optional[str] = None  # defaults to ticket_key
+
+
+class CreateWorkspaceIn(BaseModel):
+    ticket_key: str
+    ticket_title: Optional[str] = None
+    initiative_key: Optional[str] = None
+    repos: list[RepoSpecIn] = Field(default_factory=list)
+    # If true, spawn the first session immediately after worktrees are up.
+    spawn_initial_session: bool = True
+    permission_mode: Optional[str] = "acceptEdits"
+    model: Optional[str] = None
+
+
+def _workspace_dict(ws: Workspace) -> dict:
+    return {
+        "id": ws.id,
+        "ticket_key": ws.ticket_key,
+        "ticket_title": ws.ticket_title,
+        "initiative_key": ws.initiative_key,
+        "dir": ws.dir,
+        "repos": [r.to_dict() for r in ws.repos],
+        "session_ids": list(ws.session_ids),
+        "session_names": dict(ws.session_names),
+        "docs": {k: v.to_dict() for k, v in ws.docs.items()},
+        "created_at": ws.created_at,
+        "archived_at": ws.archived_at,
+    }
+
+
+@app.get("/app/workspaces")
+async def list_workspaces(include_archived: bool = False) -> dict:
+    return {
+        "workspaces": [
+            _workspace_dict(ws)
+            for ws in workspace_store.list(include_archived=include_archived)
+        ]
+    }
+
+
+@app.get("/app/workspaces/{workspace_id}")
+async def get_workspace(workspace_id: str) -> dict:
+    ws = workspace_store.get(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return _workspace_dict(ws)
+
+
+@app.post("/app/workspaces")
+async def post_workspace(body: CreateWorkspaceIn) -> dict:
+    if body.initiative_key and initiative_store.get(body.initiative_key) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown initiative_key: {body.initiative_key}. POST /app/initiatives first.",
+        )
+
+    try:
+        ws = await create_workspace(
+            workspace_store,
+            workspaces_root=_WORKSPACES_ROOT,
+            ticket_key=body.ticket_key,
+            ticket_title=body.ticket_title,
+            initiative_key=body.initiative_key,
+            repos=[RepoSpec(source_path=r.source_path, branch=r.branch) for r in body.repos],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except gw.WorktreeError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": e.code, "message": e.message, "detail": e.detail},
+        )
+
+    first_session_id: Optional[str] = None
+    if body.spawn_initial_session:
+        first_session_id = await _spawn_session_into_workspace(
+            ws,
+            permission_mode=body.permission_mode,
+            model=body.model,
+        )
+    return {
+        "workspace": _workspace_dict(workspace_store.get(ws.id) or ws),
+        "first_session_id": first_session_id,
+    }
+
+
+class PatchWorkspaceIn(BaseModel):
+    ticket_title: Optional[str] = None
+    initiative_key: Optional[str] = None
+    archived: Optional[bool] = None  # True → archive, False → unarchive
+
+
+@app.patch("/app/workspaces/{workspace_id}")
+async def patch_workspace(workspace_id: str, body: PatchWorkspaceIn) -> dict:
+    ws = workspace_store.get(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    fields: dict = {}
+    if body.ticket_title is not None:
+        fields["ticket_title"] = body.ticket_title
+    if body.initiative_key is not None:
+        if body.initiative_key and initiative_store.get(body.initiative_key) is None:
+            raise HTTPException(status_code=400, detail=f"Unknown initiative_key: {body.initiative_key}")
+        fields["initiative_key"] = body.initiative_key or None
+    if fields:
+        ws = await workspace_store.patch(workspace_id, **fields)  # type: ignore[assignment]
+    if body.archived is True:
+        ws = await workspace_store.archive(workspace_id)
+    elif body.archived is False:
+        ws = await workspace_store.unarchive(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace disappeared")
+    return _workspace_dict(ws)
+
+
+@app.delete("/app/workspaces/{workspace_id}")
+async def remove_workspace(workspace_id: str, force: bool = True) -> dict:
+    ws = workspace_store.get(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    ok = await delete_workspace(workspace_store, workspace_id, force=force)
+    return {"ok": ok}
+
+
+class AddRepoIn(BaseModel):
+    source_path: str
+    branch: Optional[str] = None
+
+
+@app.post("/app/workspaces/{workspace_id}/repos")
+async def add_repo(workspace_id: str, body: AddRepoIn) -> dict:
+    ws = workspace_store.get(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    source = str(Path(body.source_path).expanduser().resolve())
+    branch = body.branch or ws.ticket_key
+    repo_name = Path(source).name or "repo"
+    worktree_path = str(Path(ws.dir) / repo_name)
+    try:
+        await gw.add_worktree(source, worktree_path, branch)
+    except gw.WorktreeError as e:
+        raise HTTPException(status_code=400, detail={"code": e.code, "message": e.message, "detail": e.detail})
+    repo = WorkspaceRepo(source_path=source, worktree_path=worktree_path, branch=branch)
+    updated = await workspace_store.add_repo(workspace_id, repo)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Workspace disappeared")
+    return _workspace_dict(updated)
+
+
+class SpawnSessionIn(BaseModel):
+    permission_mode: Optional[str] = "acceptEdits"
+    model: Optional[str] = None
+    include_partial_messages: bool = True
+
+
+@app.post("/app/workspaces/{workspace_id}/sessions")
+async def spawn_session(workspace_id: str, body: SpawnSessionIn) -> dict:
+    ws = workspace_store.get(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    sid = await _spawn_session_into_workspace(
+        ws,
+        permission_mode=body.permission_mode,
+        model=body.model,
+        include_partial_messages=body.include_partial_messages,
+    )
+    return {"session_id": sid, "workspace": _workspace_dict(workspace_store.get(workspace_id) or ws)}
+
+
+class RenameSessionIn(BaseModel):
+    name: Optional[str] = None  # None or "" clears back to default ("S1", "S2", …)
+
+
+@app.patch("/app/workspaces/{workspace_id}/sessions/{session_id}")
+async def rename_session(workspace_id: str, session_id: str, body: RenameSessionIn) -> dict:
+    updated = await workspace_store.set_session_name(workspace_id, session_id, body.name)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Workspace or session not found")
+    return _workspace_dict(updated)
+
+
+@app.delete("/app/workspaces/{workspace_id}/sessions/{session_id}")
+async def delete_session(workspace_id: str, session_id: str) -> dict:
+    ws = workspace_store.get(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    if session_id not in ws.session_ids:
+        raise HTTPException(status_code=404, detail="Session not in workspace")
+    # Tear down the live session first (best-effort), then drop from the
+    # workspace record. Order matters: if removal fails the user can retry.
+    registry = app.state.registry
+    try:
+        await registry.remove(session_id, purge_metadata=True)
+    except Exception:
+        pass
+    updated = await workspace_store.remove_session(workspace_id, session_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Workspace disappeared")
+    return _workspace_dict(updated)
+
+
+async def _spawn_session_into_workspace(
+    ws: Workspace,
+    *,
+    permission_mode: Optional[str] = "acceptEdits",
+    model: Optional[str] = None,
+    include_partial_messages: bool = True,
+) -> str:
+    """Create a session with cwd=workspace dir + add_dirs=per-repo worktrees."""
+    registry = app.state.registry
+    config = SessionConfig(
+        model=model,
+        permission_mode=permission_mode,
+        cwd=ws.dir,
+        include_partial_messages=include_partial_messages,
+        add_dirs=[r.worktree_path for r in ws.repos],
+        workspace_id=ws.id,
+    )
+    session = await registry.create(config)
+    await workspace_store.add_session(ws.id, session.id)
+    return session.id
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Atlassian credentials — JIRA + Confluence. UI talks to these via two
+# endpoints; the token is set once and lives in a chmod-0600 JSON file. The
+# GET never returns the token, only "has_creds" + the non-secret site/email.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class AtlassianCredsIn(BaseModel):
+    site_url: str
+    email: str
+    api_token: str
+
+
+@app.get("/app/atlassian/has-creds")
+async def atlassian_has_creds() -> dict:
+    return creds_store.public_meta()
+
+
+@app.post("/app/atlassian/creds")
+async def atlassian_set_creds(body: AtlassianCredsIn) -> dict:
+    try:
+        await creds_store.set(body.site_url, body.email, body.api_token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Echo back only public metadata; never the token.
+    return creds_store.public_meta()
+
+
+@app.delete("/app/atlassian/creds")
+async def atlassian_clear_creds() -> dict:
+    await creds_store.clear()
+    return creds_store.public_meta()
+
+
+def _jira_client_or_400() -> JiraClient:
+    creds = creds_store.get()
+    if creds is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "requires_credentials", "message": "Atlassian credentials not set"},
+        )
+    return JiraClient(creds.site_url, creds.email, creds.api_token)
+
+
+@app.get("/app/workflow/search-tickets")
+async def workflow_search_tickets(q: str, max_results: int = 10) -> dict:
+    """UI-facing typeahead proxy. Live calls the JIRA API on every keystroke;
+    the JIRA endpoint itself is cheap and we cap at 10 results."""
+    client = _jira_client_or_400()
+    try:
+        results = await client.typeahead(q, max_results=max_results)
+    except JiraError as e:
+        raise HTTPException(status_code=400, detail={"code": "jira_error", "status": e.status, "message": e.message})
+    return {
+        "results": [
+            {"key": r.key, "title": r.title, "status": r.status, "issuetype": r.issuetype}
+            for r in results
+        ]
+    }
+
+
+@app.get("/app/workflow/ticket/{key}")
+async def workflow_get_ticket_raw(key: str) -> dict:
+    """Single-ticket fetch. Used by the Ticket tile in the Docs panel until
+    the full ADF→markdown round-trip lands (Phase 4)."""
+    client = _jira_client_or_400()
+    try:
+        return await client.get_issue(key)
+    except JiraError as e:
+        raise HTTPException(status_code=400, detail={"code": "jira_error", "status": e.status, "message": e.message})
+
+
+@app.get("/app/workflow/ticket-meta/{key}")
+async def workflow_ticket_meta(key: str) -> dict:
+    """Compact ticket metadata for inline validation/preview in the UI.
+
+    Returns just enough to confirm "yes this ticket exists" and give the
+    user a sanity-check title — no description body. Used by the Initiative
+    Manager when validating an epic key.
+    """
+    client = _jira_client_or_400()
+    try:
+        raw = await client.get_issue(key, fields=["summary", "status", "issuetype"])
+    except JiraError as e:
+        raise HTTPException(status_code=400, detail={"code": "jira_error", "status": e.status, "message": e.message})
+    f = raw.get("fields") or {}
+    def name(o):
+        return o.get("name") if isinstance(o, dict) else None
+    creds = creds_store.get()
+    url = f"{creds.site_url}/browse/{key}" if creds else None
+    return {
+        "key": str(raw.get("key") or key),
+        "title": f.get("summary") or "",
+        "status": name(f.get("status")),
+        "issuetype": name(f.get("issuetype")),
+        "url": url,
+    }
+
+
+@app.get("/app/workflow/search-pages")
+async def workflow_search_pages(q: str, limit: int = 10) -> dict:
+    """Fuzzy Confluence page search by title (CQL backed). Used by the
+    Initiative Manager's root-page typeahead."""
+    creds = creds_store.get()
+    if creds is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "requires_credentials", "message": "Atlassian credentials not set"},
+        )
+    client = ConfluenceClient(creds.site_url, creds.email, creds.api_token)
+    try:
+        results = await client.search_pages(q, limit=limit)
+    except ConfluenceError as e:
+        raise HTTPException(status_code=400, detail={"code": "confluence_error", "status": e.status, "message": e.message})
+    return {"results": results}
+
+
+@app.get("/app/workflow/page/{page_id}")
+async def workflow_get_confluence_page(page_id: str, include_body: bool = True) -> dict:
+    """Resolve a Confluence page id → title + url + ADF body.
+
+    The body is included by default so the in-app viewer can render the
+    page inline. Set ?include_body=0 for cheap metadata fetches (e.g. the
+    Initiative Manager's root-page validation tooltip)."""
+    creds = creds_store.get()
+    if creds is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "requires_credentials", "message": "Atlassian credentials not set"},
+        )
+    client = ConfluenceClient(creds.site_url, creds.email, creds.api_token)
+    try:
+        page = await client.get_page(page_id)
+    except ConfluenceError as e:
+        raise HTTPException(status_code=400, detail={"code": "confluence_error", "status": e.status, "message": e.message})
+    out: dict = {
+        "id": page.id,
+        "title": page.title,
+        "space_id": page.space_id,
+        "parent_id": page.parent_id,
+        "version": page.version,
+        "url": page.url,
+    }
+    if include_body:
+        out["body_adf"] = page.body_adf
+    return out
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Settings — app-level user preferences (theme, etc).
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@app.get("/app/settings")
+async def get_settings() -> dict:
+    return {"settings": settings_store.snapshot()}
+
+
+@app.patch("/app/settings")
+async def patch_settings(updates: dict) -> dict:
+    """Shallow-merge per category. Pass `null` for a key to delete it."""
+    merged = await settings_store.patch(updates or {})
+    return {"settings": merged}
 
 
 if __name__ == "__main__":

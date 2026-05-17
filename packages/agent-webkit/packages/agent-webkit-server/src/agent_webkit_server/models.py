@@ -105,6 +105,13 @@ class CreateSessionRequest(BaseModel):
     # Opt-in: when true, the bridge asks the SDK for raw stream events and
     # translates content_block_delta frames into wire `message_delta` events.
     include_partial_messages: bool = False
+    # Extra dirs forwarded to ClaudeAgentOptions.add_dirs / CLI --add-dir.
+    # Used by multi-repo workspaces where cwd is the workspace root and
+    # add_dirs are the per-repo worktrees.
+    add_dirs: list[str] = []
+    # App-layer association. Opaque to agent-webkit; apps use it to tie a
+    # session to e.g. a workspace/ticket.
+    workspace_id: Optional[str] = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -121,6 +128,8 @@ class SessionListEntry(BaseModel):
     include_partial_messages: bool = False
     created_at: float
     last_seen_at: float
+    add_dirs: list[str] = []
+    workspace_id: Optional[str] = None
 
 
 class SessionListResponse(BaseModel):

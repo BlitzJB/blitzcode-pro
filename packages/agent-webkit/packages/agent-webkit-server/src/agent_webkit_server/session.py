@@ -44,6 +44,8 @@ class SessionConfig:
         cwd: Optional[str] = None,
         include_partial_messages: bool = False,
         resume: Optional[str] = None,
+        add_dirs: Optional[list[str]] = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
         self.model = model
         self.permission_mode = permission_mode
@@ -57,6 +59,14 @@ class SessionConfig:
         # reap, etc.). The SDK loads the prior transcript so the agent picks up
         # full context. None means "fresh session, no resume."
         self.resume = resume
+        # Extra directories the SDK can grant tool access to beyond `cwd`.
+        # Maps to ClaudeAgentOptions.add_dirs / CLI --add-dir. Used by
+        # multi-repo workspaces where cwd is the workspace root and add_dirs
+        # are the per-repo worktrees.
+        self.add_dirs = add_dirs or []
+        # App-layer association — opaque to agent-webkit. Apps (e.g.
+        # blitzcode-pro) use this to tie a session to a workspace/ticket.
+        self.workspace_id = workspace_id
 
 
 class Session:
@@ -398,6 +408,8 @@ class SessionRegistry:
                 permission_mode=config.permission_mode,
                 cwd=config.cwd,
                 include_partial_messages=config.include_partial_messages,
+                add_dirs=list(config.add_dirs),
+                workspace_id=config.workspace_id,
             ))
         return session
 
@@ -457,6 +469,8 @@ class SessionRegistry:
                     permission_mode=config.permission_mode,
                     cwd=config.cwd,
                     include_partial_messages=config.include_partial_messages,
+                    add_dirs=list(config.add_dirs),
+                    workspace_id=config.workspace_id,
                 ))
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Failed to persist session metadata for %s", session_id)
@@ -483,6 +497,8 @@ class SessionRegistry:
                     include_partial_messages=existing.include_partial_messages,
                     created_at=existing.created_at,
                     last_seen_at=existing.last_seen_at,
+                    add_dirs=list(existing.add_dirs),
+                    workspace_id=existing.workspace_id,
                 ))
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Failed to persist permission_mode for %s", session_id)
@@ -557,6 +573,8 @@ class SessionRegistry:
             cwd=metadata.cwd,
             include_partial_messages=metadata.include_partial_messages,
             resume=metadata.sdk_session_id,  # may be None — factory will skip resume=
+            add_dirs=list(metadata.add_dirs),
+            workspace_id=metadata.workspace_id,
         )
         try:
             session = await self._build_session(session_id, config)

@@ -37,12 +37,19 @@ class SessionMetadata:
     include_partial_messages: bool = False
     created_at: float = field(default_factory=time.time)
     last_seen_at: float = field(default_factory=time.time)
+    add_dirs: list[str] = field(default_factory=list)
+    # App-layer field — opaque to agent-webkit. Apps use it to associate
+    # a session with whatever higher-level grouping makes sense to them
+    # (e.g. blitzcode-pro's workspace/ticket). Persisted so resumes after
+    # a server restart restore the binding.
+    workspace_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "SessionMetadata":
+        raw_add_dirs = data.get("add_dirs") or []
         return cls(
             id=data["id"],
             sdk_session_id=data.get("sdk_session_id"),
@@ -52,6 +59,8 @@ class SessionMetadata:
             include_partial_messages=bool(data.get("include_partial_messages", False)),
             created_at=float(data.get("created_at", time.time())),
             last_seen_at=float(data.get("last_seen_at", time.time())),
+            add_dirs=[str(d) for d in raw_add_dirs if isinstance(d, str)],
+            workspace_id=data.get("workspace_id") or None,
         )
 
 

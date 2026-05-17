@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 import os
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -32,16 +32,25 @@ logger = logging.getLogger(__name__)
 def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk; covered indirectly by integration tests
     session_store: Any = None,
     genui: Any = None,
+    system_prompt_append: Optional[Callable[[SessionConfig], Optional[str]]] = None,
+    extra_mcp_servers: Optional[Callable[[SessionConfig], Optional[dict[str, Any]]]] = None,
+    extra_allowed_tools: Optional[Callable[[SessionConfig], Optional[list[str]]]] = None,
 ):
-    """Build the default factory, optionally pre-wired with a SessionStore and/or GenUI.
+    """Build the default factory.
 
-    The callback is plumbed in via ClaudeAgentOptions(can_use_tool=...) — the SDK's
-    documented contract — so no post-construction mutation is required. If a
-    ``session_store`` is supplied it is forwarded to ``ClaudeAgentOptions`` so the
-    SDK persists conversation state through it. If a ``genui`` registry is supplied,
-    the factory mounts an in-process MCP server exposing one tool per registered
-    component, auto-allows those tool calls through ``can_use_tool``, and merges a
-    system-prompt addendum that nudges the model to use them.
+    Optional extension points (all callables receive the SessionConfig so the
+    app can inspect e.g. ``workspace_id`` to decide what to inject):
+
+    - ``system_prompt_append(cfg) -> str | None``: extra prose appended to the
+      Claude Code preset's system prompt. Composes with GenUI's addendum
+      (both are concatenated, GenUI first).
+    - ``extra_mcp_servers(cfg) -> dict | None``: additional MCP servers to
+      merge into ``ClaudeAgentOptions.mcp_servers``. Key collisions raise.
+    - ``extra_allowed_tools(cfg) -> list[str] | None``: extra patterns merged
+      into ``allowed_tools``. Use for auto-approving the workflow MCP's tools.
+
+    These are app-layer hooks — the agent-webkit core knows nothing about
+    workspaces or workflows; it just provides plumbing.
     """
     async def factory(config: SessionConfig, can_use_tool: Any) -> SDKClient:
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # type: ignore
@@ -70,6 +79,8 @@ def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk
             options_kwargs["permission_mode"] = config.permission_mode
         if config.cwd:
             options_kwargs["cwd"] = config.cwd
+        if config.add_dirs:
+            options_kwargs["add_dirs"] = list(config.add_dirs)
         if session_store is not None:
             options_kwargs["session_store"] = session_store
         if config.include_partial_messages:
@@ -80,17 +91,48 @@ def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk
             # transcript from disk and continues the conversation.
             options_kwargs["resume"] = config.resume
 
+        # MCP servers come from two sources today: GenUI and the app-layer
+        # `extra_mcp_servers` hook. Merge into one dict; raise on key
+        # collision so we never silently drop a server.
+        mcp_servers: dict[str, Any] = {}
+        allowed_tools: list[str] = []
+        prompt_additions: list[str] = []
+
         if genui is not None:
-            mcp_server = genui.build_mcp_server()
-            options_kwargs["mcp_servers"] = {genui.server_name: mcp_server}
-            options_kwargs["allowed_tools"] = genui.allowed_tool_patterns()
-            addendum = genui.system_prompt_addendum()
-            if addendum:
-                options_kwargs["system_prompt"] = {
-                    "type": "preset",
-                    "preset": "claude_code",
-                    "append": addendum,
-                }
+            mcp_servers[genui.server_name] = genui.build_mcp_server()
+            allowed_tools.extend(genui.allowed_tool_patterns())
+            genui_addendum = genui.system_prompt_addendum()
+            if genui_addendum:
+                prompt_additions.append(genui_addendum)
+
+        if extra_mcp_servers is not None:
+            extra = extra_mcp_servers(config) or {}
+            for name, server in extra.items():
+                if name in mcp_servers:
+                    raise ValueError(
+                        f"MCP server name collision: {name!r} already provided by genui or another source"
+                    )
+                mcp_servers[name] = server
+
+        if extra_allowed_tools is not None:
+            tools = extra_allowed_tools(config) or []
+            allowed_tools.extend(tools)
+
+        if system_prompt_append is not None:
+            app_addendum = system_prompt_append(config)
+            if app_addendum:
+                prompt_additions.append(app_addendum)
+
+        if mcp_servers:
+            options_kwargs["mcp_servers"] = mcp_servers
+        if allowed_tools:
+            options_kwargs["allowed_tools"] = allowed_tools
+        if prompt_additions:
+            options_kwargs["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": "\n\n".join(prompt_additions),
+            }
 
         options = ClaudeAgentOptions(**options_kwargs)
         client = ClaudeSDKClient(options=options)
@@ -111,6 +153,9 @@ def create_app(
     session_store: Any = None,
     genui: Any = None,
     metadata_store: Any = None,
+    system_prompt_append: Optional[Callable[[SessionConfig], Optional[str]]] = None,
+    extra_mcp_servers: Optional[Callable[[SessionConfig], Optional[dict[str, Any]]]] = None,
+    extra_allowed_tools: Optional[Callable[[SessionConfig], Optional[list[str]]]] = None,
 ) -> FastAPI:
     """Build a FastAPI app exposing the agent-webkit wire protocol.
 
@@ -132,7 +177,13 @@ def create_app(
     """
     auth = auth or AuthConfig.from_env()
     if sdk_factory is None:
-        sdk_factory = _make_real_sdk_factory(session_store=session_store, genui=genui)
+        sdk_factory = _make_real_sdk_factory(
+            session_store=session_store,
+            genui=genui,
+            system_prompt_append=system_prompt_append,
+            extra_mcp_servers=extra_mcp_servers,
+            extra_allowed_tools=extra_allowed_tools,
+        )
     registry = SessionRegistry(sdk_factory, metadata_store=metadata_store)
 
     @contextlib.asynccontextmanager
@@ -172,6 +223,8 @@ def create_app(
                 include_partial_messages=r.include_partial_messages,
                 created_at=r.created_at,
                 last_seen_at=r.last_seen_at,
+                add_dirs=list(r.add_dirs),
+                workspace_id=r.workspace_id,
             )
             for r in records
         ])
@@ -183,6 +236,8 @@ def create_app(
             permission_mode=req.permission_mode,
             cwd=req.cwd,
             include_partial_messages=req.include_partial_messages,
+            add_dirs=list(req.add_dirs),
+            workspace_id=req.workspace_id,
         )
         s = await registry.create(config)
         return CreateSessionResponse(session_id=s.id, protocol_version=PROTOCOL_VERSION)

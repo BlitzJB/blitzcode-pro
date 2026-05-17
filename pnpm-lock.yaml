@@ -62,6 +62,9 @@ importers:
       typescript:
         specifier: ^5
         version: 5.9.3
+      vitest:
+        specifier: ^1.6.1
+        version: 1.6.1(@types/node@20.19.41)(happy-dom@14.12.3)(lightningcss@1.32.0)
 
   packages/agent-webkit:
     devDependencies:
