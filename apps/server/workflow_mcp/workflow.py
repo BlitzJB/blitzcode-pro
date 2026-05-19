@@ -181,6 +181,135 @@ def build_workflow_mcp_server(deps: WorkflowDeps):
         await client.link_action_item(from_key, to_key)
         return _text_result(f"linked {from_key} → {to_key} (Action item)")
 
+    async def t_create_ticket(args: dict) -> dict:
+        project_key = _str(args, "project_key")
+        summary = _str(args, "summary")
+        description_md = _str_opt(args, "description_md")
+        issuetype = _str_opt(args, "issuetype") or "Task"
+        labels = args.get("labels")
+        if labels is not None and not (isinstance(labels, list) and all(isinstance(x, str) for x in labels)):
+            raise _ToolError("invalid_args", "labels must be a list of strings if provided")
+        priority = _str_opt(args, "priority")
+        parent_key = _str_opt(args, "parent_key")
+        client = jira()
+        adf = markdown_to_adf(description_md) if description_md else None
+        out = await client.create_issue(
+            project_key=project_key,
+            summary=summary,
+            description_adf=adf,
+            issuetype=issuetype,
+            labels=labels,
+            priority=priority,
+            parent_key=parent_key,
+        )
+        key = out.get("key", "?")
+        creds = deps.creds_store.get()
+        url = f"{creds.site_url}/browse/{key}" if creds else None
+        return _text_result(
+            f"created **{key}**: {summary}\n"
+            + (f"{url}\n" if url else "")
+            + (f"parent epic: {parent_key}\n" if parent_key else "")
+        )
+
+    async def t_get_ticket_changelog(args: dict) -> dict:
+        key = _str(args, "key")
+        max_items = int(args.get("max_items", 50))
+        client = jira()
+        rows = await client.changelog(key, max_items=max_items)
+        if not rows:
+            return _text_result(f"(no recorded changes for {key})")
+        lines = [f"# {key} — change history (most recent first)\n"]
+        for r in rows:
+            ts = r.get("created") or "?"
+            who = r.get("author") or "?"
+            fld = r.get("field") or "?"
+            frm = r.get("from") or "_(unset)_"
+            to = r.get("to") or "_(unset)_"
+            lines.append(f"- `{ts}` **{who}** changed **{fld}**: {frm} → {to}")
+        return _text_result("\n".join(lines))
+
+    async def t_recap(args: dict) -> dict:
+        """Activity summary for a date window — what the user (or their
+        team) touched. Used for end-of-day/end-of-week recaps."""
+        since = _str(args, "since")  # ISO date, e.g. "2026-05-12"
+        until = _str_opt(args, "until")  # ISO date, inclusive
+        scope = (args.get("scope") or "me").lower()
+        if scope not in ("me", "all"):
+            raise _ToolError("invalid_args", "scope must be 'me' or 'all'")
+        client = jira()
+        # JQL date filters: "updated >= '2026-05-12'" + optional upper bound.
+        # Wrap the date in single quotes to keep the parser happy on Cloud.
+        clauses = [f"updated >= '{since}'"]
+        if until:
+            clauses.append(f"updated <= '{until}'")
+        if scope == "me":
+            # Either the user changed it or it's currently assigned to them.
+            clauses.append("(assignee = currentUser() OR updatedBy = currentUser())")
+        jql = " AND ".join(clauses) + " ORDER BY updated DESC"
+        data = await client.search_jql(
+            jql, fields=["summary", "status", "issuetype", "updated", "assignee"], max_results=50
+        )
+        issues = data.get("issues") or []
+        if not issues:
+            return _text_result(f"No JIRA activity in window {since} → {until or 'now'} ({scope}).")
+        lines = [f"# Activity {since} → {until or 'now'} ({scope})\n"]
+        for it in issues:
+            f = it.get("fields") or {}
+            status = ((f.get("status") or {}).get("name")) or "?"
+            assignee = ((f.get("assignee") or {}).get("displayName")) or "_(unassigned)_"
+            ts = f.get("updated") or "?"
+            lines.append(
+                f"- **{it.get('key')}** — {f.get('summary') or ''} "
+                f"_[{status} · {assignee} · {ts}]_"
+            )
+        lines.append("")
+        lines.append("Drill into any one with `workflow_get_ticket` or `workflow_get_ticket_changelog`.")
+        return _text_result("\n".join(lines))
+
+    async def t_list_projects(_args: dict) -> dict:
+        client = jira()
+        rows = await client.list_projects()
+        if not rows:
+            return _text_result("(no projects visible)")
+        lines = [f"- `{r['key']}` — {r['name']}" for r in rows]
+        return _text_result("\n".join(lines))
+
+    async def t_list_page_versions(args: dict) -> dict:
+        page_id = _str(args, "page_id")
+        client = confluence()
+        rows = await client.list_versions(page_id)
+        if not rows:
+            return _text_result(f"(no version history for page {page_id})")
+        lines = [f"# Page {page_id} — version history\n"]
+        for r in rows:
+            ts = r.get("created_at") or "?"
+            msg = r.get("message") or "_(no message)_"
+            tag = " (minor)" if r.get("minor_edit") else ""
+            lines.append(f"- v{r['number']} — `{ts}`{tag} — {msg}")
+        return _text_result("\n".join(lines))
+
+    async def t_diff_page_versions(args: dict) -> dict:
+        page_id = _str(args, "page_id")
+        v_from = int(_str(args, "from_version"))
+        v_to = int(_str(args, "to_version"))
+        client = confluence()
+        a = await client.get_page_at_version(page_id, v_from)
+        b = await client.get_page_at_version(page_id, v_to)
+        md_a, _ = adf_to_markdown(a["body_adf"])
+        md_b, _ = adf_to_markdown(b["body_adf"])
+        import difflib as _dl
+        diff = "\n".join(_dl.unified_diff(
+            md_a.splitlines(),
+            md_b.splitlines(),
+            fromfile=f"v{v_from} ({a.get('created_at')})",
+            tofile=f"v{v_to} ({b.get('created_at')})",
+            lineterm="",
+            n=3,
+        ))
+        if not diff.strip():
+            return _text_result(f"(no markdown-level changes between v{v_from} and v{v_to})")
+        return _text_result("```diff\n" + diff + "\n```")
+
     async def t_list_initiatives(_args: dict) -> dict:
         items = deps.initiative_store.list()
         if not items:
@@ -383,6 +512,77 @@ def build_workflow_mcp_server(deps: WorkflowDeps):
             },
         )(wrap(t_unflag)),
         tool(
+            "workflow_create_ticket",
+            "Create a new JIRA issue. Required: project_key, summary. Optional: description_md (markdown, server converts to ADF), issuetype (default 'Task'), labels, priority, parent_key (epic to nest under). Returns the new key + URL.",
+            {
+                "type": "object",
+                "properties": {
+                    "project_key": {"type": "string", "description": "JIRA project key, e.g. 'LLM'."},
+                    "summary": {"type": "string"},
+                    "description_md": {"type": "string"},
+                    "issuetype": {"type": "string", "description": "Defaults to 'Task'. Common values: Task, Story, Bug, Epic."},
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                    "priority": {"type": "string"},
+                    "parent_key": {"type": "string", "description": "JIRA key of the parent epic (next-gen projects)."},
+                },
+                "required": ["project_key", "summary"],
+                "additionalProperties": False,
+            },
+        )(wrap(t_create_ticket)),
+        tool(
+            "workflow_get_ticket_changelog",
+            "Get the full change history of a JIRA issue: who changed what when. Most recent first.",
+            {
+                "type": "object",
+                "properties": {**s_key(), "max_items": {"type": "integer", "minimum": 1, "maximum": 100}},
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+        )(wrap(t_get_ticket_changelog)),
+        tool(
+            "workflow_list_projects",
+            "List JIRA projects visible to the user. Returns key + name.",
+            SCHEMA_NONE,
+        )(wrap(t_list_projects)),
+        tool(
+            "workflow_recap",
+            "Activity recap for a date window. `since` and optional `until` are ISO dates (YYYY-MM-DD). `scope`: 'me' (default — issues you touched or are assigned to) or 'all' (everything that changed in the window). Used for end-of-day/end-of-week summaries.",
+            {
+                "type": "object",
+                "properties": {
+                    "since": {"type": "string"},
+                    "until": {"type": "string"},
+                    "scope": {"type": "string", "enum": ["me", "all"]},
+                },
+                "required": ["since"],
+                "additionalProperties": False,
+            },
+        )(wrap(t_recap)),
+        tool(
+            "workflow_list_page_versions",
+            "List all version numbers of a Confluence page, most recent first. Use before workflow_diff_page_versions.",
+            {
+                "type": "object",
+                "properties": {"page_id": {"type": "string"}},
+                "required": ["page_id"],
+                "additionalProperties": False,
+            },
+        )(wrap(t_list_page_versions)),
+        tool(
+            "workflow_diff_page_versions",
+            "Unified markdown diff between two versions of a Confluence page. Both versions are fetched, ADF→markdown converted, then diffed line-by-line.",
+            {
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "from_version": {"type": "string"},
+                    "to_version": {"type": "string"},
+                },
+                "required": ["page_id", "from_version", "to_version"],
+                "additionalProperties": False,
+            },
+        )(wrap(t_diff_page_versions)),
+        tool(
             "workflow_link_action_item",
             "Create an 'Action item' link from one issue to another (for follow-up gaps).",
             {
@@ -478,6 +678,14 @@ ALLOWED_TOOL_PATTERNS = [
     "mcp__workflow__workflow_write_rfc",
     "mcp__workflow__workflow_get_debrief",
     "mcp__workflow__workflow_write_debrief",
+    # JIRA read + create — safe for the agent to fire without prompting.
+    "mcp__workflow__workflow_create_ticket",
+    "mcp__workflow__workflow_get_ticket_changelog",
+    "mcp__workflow__workflow_list_projects",
+    "mcp__workflow__workflow_recap",
+    # Confluence version history + diff — pure reads.
+    "mcp__workflow__workflow_list_page_versions",
+    "mcp__workflow__workflow_diff_page_versions",
     # Intentionally NOT auto-allowed:
     # - workflow_flag, workflow_unflag — explicit human approval required per
     #   the workflow spec.

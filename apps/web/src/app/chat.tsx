@@ -359,6 +359,8 @@ export interface WorkspaceDocRefDTO {
   last_synced_at: number | null;
 }
 
+export type WorkspaceKind = "ticket" | "chat";
+
 export interface WorkspaceDTO {
   id: string;
   ticket_key: string;
@@ -371,6 +373,7 @@ export interface WorkspaceDTO {
   docs: Record<string, WorkspaceDocRefDTO>;
   created_at: number;
   archived_at: number | null;
+  kind: WorkspaceKind;
 }
 
 export interface InitiativeDTO {
@@ -402,6 +405,7 @@ interface UseWorkspaces {
   addRepo: (id: string, args: { source_path: string; branch?: string }) => Promise<void>;
   renameSession: (workspaceId: string, sessionId: string, name: string | null) => Promise<void>;
   deleteSession: (workspaceId: string, sessionId: string) => Promise<void>;
+  createChat: () => Promise<{ workspace: WorkspaceDTO; first_session_id: string | null }>;
 }
 
 function useWorkspaces(baseUrl: string): UseWorkspaces {
@@ -529,13 +533,28 @@ function useWorkspaces(baseUrl: string): UseWorkspaces {
     [baseUrl, refresh]
   );
 
+  const createChat = useCallback(
+    async () => {
+      const r = await fetch(`${baseUrl}/app/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      const data = await r.json();
+      await refresh();
+      return data as { workspace: WorkspaceDTO; first_session_id: string | null };
+    },
+    [baseUrl, refresh]
+  );
+
   return useMemo(
     () => ({
       list, hydrated, refresh, create, archive, unarchive, remove,
-      spawnSession, addRepo, renameSession, deleteSession,
+      spawnSession, addRepo, renameSession, deleteSession, createChat,
     }),
     [list, hydrated, refresh, create, archive, unarchive, remove,
-     spawnSession, addRepo, renameSession, deleteSession]
+     spawnSession, addRepo, renameSession, deleteSession, createChat]
   );
 }
 
@@ -729,6 +748,196 @@ function mergeSettings(prev: SettingsShape, updates: Partial<SettingsShape>): Se
   return out;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Viewport shape — drives responsive layout decisions. Three shapes:
+//   * desktop ≥ 1280px — full four-pane layout (sidebar + chat + doc + right)
+//   * tablet  768-1279px — doc slot becomes a bottom sheet over chat
+//   * phone   < 768px — sidebar becomes drawer, doc + todos become sheets,
+//                       header condenses, session tabs become a popover
+// ────────────────────────────────────────────────────────────────────────────
+
+export type ViewportShape = "desktop" | "tablet" | "phone";
+
+function resolveShape(width: number): ViewportShape {
+  if (width < 768) return "phone";
+  if (width < 1280) return "tablet";
+  return "desktop";
+}
+
+function useViewportShape(): ViewportShape {
+  // Default to "desktop" on the SSR pass so the initial server-rendered
+  // HTML matches the desktop case. The first client-side measurement
+  // corrects it before any meaningful interaction.
+  const [shape, setShape] = useState<ViewportShape>("desktop");
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const apply = () => setShape(resolveShape(window.innerWidth));
+    apply();
+    window.addEventListener("resize", apply);
+    return () => window.removeEventListener("resize", apply);
+  }, []);
+  return shape;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// BottomSheet — slide-up panel used on tablet/phone where lateral space
+// runs out. Drag-down to dismiss + backdrop click + Escape, all wired
+// to onDismiss. The content card has its own scroll container so long
+// docs don't bleed past the sheet.
+// ────────────────────────────────────────────────────────────────────────────
+
+function BottomSheet({
+  children,
+  onDismiss,
+  height = "82vh",
+}: {
+  children: React.ReactNode;
+  onDismiss: () => void;
+  height?: string;
+}) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.stopPropagation(); onDismiss(); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onDismiss]);
+
+  if (!mounted || typeof document === "undefined") return null;
+
+  const tree = (
+    <motion.div
+      className="fixed inset-0 z-30 flex items-end justify-center bg-black/30"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.18, ease: EASE_OUT }}
+      onClick={(e) => { if (e.target === e.currentTarget) onDismiss(); }}
+    >
+      <motion.div
+        // Drag down past ~120px or with downward velocity → dismiss.
+        // Up-drag does nothing (no overscroll).
+        drag="y"
+        dragConstraints={{ top: 0, bottom: 0 }}
+        dragElastic={{ top: 0, bottom: 0.4 }}
+        onDragEnd={(_, info) => {
+          if (info.offset.y > 120 || info.velocity.y > 600) onDismiss();
+        }}
+        initial={{ y: "100%" }}
+        animate={{ y: 0 }}
+        exit={{ y: "100%" }}
+        transition={{ type: "spring", stiffness: 320, damping: 36 }}
+        className="w-full max-w-3xl bg-canvas border-t border-x border-line rounded-t-2xl shadow-2xl flex flex-col overflow-hidden"
+        style={{ height }}
+      >
+        {/* Drag handle. Mostly visual — the whole sheet is draggable. */}
+        <div className="shrink-0 flex justify-center py-2 cursor-grab active:cursor-grabbing">
+          <div className="w-9 h-1 rounded-full bg-line-strong" />
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden">
+          {children}
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+  return createPortal(tree, document.body);
+}
+
+
+// ────────────────────────────────────────────────────────────────────────────
+// LAN access — phone-as-second-client gate. Server-stored token lives
+// in lan-access.json (chmod 0600). Disabled by default; flipping it on
+// rotates the token + returns URLs phones can use to connect.
+// ────────────────────────────────────────────────────────────────────────────
+
+export interface TunnelMeta {
+  state: "off" | "starting" | "on" | "error";
+  url: string | null;
+  error?: string | null;
+  configured: boolean;
+  public_join_url: string | null;
+}
+
+export interface LanAccessMeta {
+  enabled: boolean;
+  token: string | null;
+  lan_urls: string[];
+  tunnel: TunnelMeta;
+}
+
+const DEFAULT_TUNNEL: TunnelMeta = {
+  state: "off",
+  url: null,
+  error: null,
+  configured: false,
+  public_join_url: null,
+};
+
+interface UseLanAccess {
+  meta: LanAccessMeta;
+  hydrated: boolean;
+  refresh: () => Promise<void>;
+  toggle: (enabled: boolean) => Promise<void>;
+  toggleTunnel: (enabled: boolean) => Promise<void>;
+  setNgrokAuthtoken: (token: string) => Promise<void>;
+  clearNgrokAuthtoken: () => Promise<void>;
+}
+
+function useLanAccess(baseUrl: string): UseLanAccess {
+  const [meta, setMeta] = useState<LanAccessMeta>({
+    enabled: false,
+    token: null,
+    lan_urls: [],
+    tunnel: DEFAULT_TUNNEL,
+  });
+  const [hydrated, setHydrated] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      const r = await fetch(`${baseUrl}/app/lan-access`);
+      if (!r.ok) return;
+      const data = await r.json();
+      setMeta({ ...data, tunnel: data.tunnel ?? DEFAULT_TUNNEL });
+    } catch { /* ignore */ }
+    finally { setHydrated(true); }
+  }, [baseUrl]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const post = useCallback(async (body: Record<string, unknown>) => {
+    const r = await fetch(`${baseUrl}/app/lan-access`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    const data = await r.json();
+    setMeta({ ...data, tunnel: data.tunnel ?? DEFAULT_TUNNEL });
+  }, [baseUrl]);
+  const toggle = useCallback((enabled: boolean) => post({ enabled }), [post]);
+  const toggleTunnel = useCallback((enabled: boolean) => post({ tunnel_enabled: enabled }), [post]);
+  const setNgrokAuthtoken = useCallback(async (authtoken: string) => {
+    const r = await fetch(`${baseUrl}/app/lan-access/ngrok-authtoken`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ authtoken }),
+    });
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    const data = await r.json();
+    setMeta({ ...data, tunnel: data.tunnel ?? DEFAULT_TUNNEL });
+  }, [baseUrl]);
+  const clearNgrokAuthtoken = useCallback(async () => {
+    const r = await fetch(`${baseUrl}/app/lan-access/ngrok-authtoken`, { method: "DELETE" });
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    const data = await r.json();
+    setMeta({ ...data, tunnel: data.tunnel ?? DEFAULT_TUNNEL });
+  }, [baseUrl]);
+  return useMemo(
+    () => ({ meta, hydrated, refresh, toggle, toggleTunnel, setNgrokAuthtoken, clearNgrokAuthtoken }),
+    [meta, hydrated, refresh, toggle, toggleTunnel, setNgrokAuthtoken, clearNgrokAuthtoken]
+  );
+}
+
+
 function useAtlassianCreds(baseUrl: string): UseAtlassianCreds {
   const [meta, setMeta] = useState<AtlassianCredsMeta>({ has_creds: false, site_url: null, email: null });
 
@@ -867,6 +1076,7 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
   const workspaces = useWorkspaces(baseUrl);
   const initiatives = useInitiatives(baseUrl);
   const atlassianCreds = useAtlassianCreds(baseUrl);
+  const lanAccess = useLanAccess(baseUrl);
   const userSettings = useSettings(baseUrl);
   useApplyTheme(userSettings.theme, userSettings.hydrated);
   useTauriShell();
@@ -874,11 +1084,45 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
   // One persistent multiplexed stream for the whole app. Sessions are
   // spawned via /app/workspaces/{id}/sessions (server-side), but show up
   // in mux.sessionList via the standard /sessions list refresh.
+  //
+  // The same stream also carries `app:*` lifecycle events the server
+  // emits whenever any client mutates shared state. We invalidate the
+  // matching cache on receipt so a phone-side mutation reflects on the
+  // .app within one SSE round-trip — and vice versa. Self-fanout (the
+  // client that initiated the mutation also receives its own event) is
+  // harmless: all refresh hooks are idempotent GETs.
   const mux = useAgentMux({
     baseUrl,
     onEvent: (ev) => {
       if (ev.event === "result" && ev.session_id) {
         acks.markCompletionLocal(ev.session_id);
+        return;
+      }
+      // agent-webkit's `ev.event` is typed as the union of agent-side
+      // events; the `app:*` names live outside that union (server-only
+      // wire contract), so we widen to string for the switch.
+      const name = ev.event as string;
+      if (!name.startsWith("app:")) return;
+      switch (name) {
+        case "app:workspace_created":
+        case "app:workspace_updated":
+        case "app:workspace_deleted":
+          void workspaces.refresh();
+          break;
+        case "app:initiative_created":
+        case "app:initiative_updated":
+        case "app:initiative_deleted":
+          void initiatives.refresh();
+          break;
+        case "app:settings_updated":
+          void userSettings.refresh();
+          break;
+        case "app:creds_updated":
+          void atlassianCreds.refresh();
+          break;
+        case "app:lan_access_toggled":
+          void lanAccess.refresh();
+          break;
       }
     },
   });
@@ -888,6 +1132,14 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [activeSessionByWs, setActiveSessionByWs] = useState<Record<string, string>>({});
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
+  const [creatingChat, setCreatingChat] = useState(false);
+  const viewportShape = useViewportShape();
+  // Phone-only: the sidebar is hidden by default and drawn from the
+  // left when the hamburger fires. Reset when the viewport widens.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  useEffect(() => {
+    if (viewportShape !== "phone") setSidebarOpen(false);
+  }, [viewportShape]);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [initiativeModalOpen, setInitiativeModalOpen] = useState(false);
   const [credsModalOpen, setCredsModalOpen] = useState(false);
@@ -944,6 +1196,23 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
     [workspaces, mux]
   );
 
+  const createChatWorkspace = useCallback(
+    async () => {
+      setCreatingChat(true);
+      try {
+        const out = await workspaces.createChat();
+        setActiveWorkspaceId(out.workspace.id);
+        if (out.first_session_id) {
+          setActiveSessionByWs((prev) => ({ ...prev, [out.workspace.id]: out.first_session_id! }));
+        }
+        void mux.refreshSessions();
+      } finally {
+        setCreatingChat(false);
+      }
+    },
+    [workspaces, mux]
+  );
+
   const spawnSessionIntoWorkspace = useCallback(
     async (workspaceId: string) => {
       const sid = await workspaces.spawnSession(workspaceId);
@@ -974,25 +1243,43 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
     [workspaces, mux]
   );
 
+  // Sidebar element is the same shape across viewports — we just mount
+  // it inline (desktop + tablet) or wrap it in a drawer (phone).
+  // Selecting a workspace on phone auto-dismisses the drawer.
+  const sidebarElement = (
+    <TicketSidebar
+      workspaces={workspaces.list}
+      initiatives={initiatives.list}
+      sessions={mux.sessionList}
+      sessionStates={mux.sessions}
+      acks={acks}
+      activeWorkspaceId={activeWorkspaceId}
+      atlassianMeta={atlassianCreds.meta}
+      onSelect={(id) => {
+        setActiveWorkspaceId(id);
+        if (viewportShape === "phone") setSidebarOpen(false);
+      }}
+      onOpenCreate={() => {
+        setCreateModalOpen(true);
+        if (viewportShape === "phone") setSidebarOpen(false);
+      }}
+      onOpenChat={() => {
+        void createChatWorkspace();
+        if (viewportShape === "phone") setSidebarOpen(false);
+      }}
+      creatingChat={creatingChat}
+      onOpenInitiatives={() => setInitiativeModalOpen(true)}
+      onOpenArchive={() => setArchiveModalOpen(true)}
+      onOpenSettings={() => setSettingsModalOpen(true)}
+      onArchive={workspaces.archive}
+      onUnarchive={workspaces.unarchive}
+      onDelete={workspaces.remove}
+    />
+  );
+
   return (
-    <div className="flex h-screen bg-canvas text-ink">
-      <TicketSidebar
-        workspaces={workspaces.list}
-        initiatives={initiatives.list}
-        sessions={mux.sessionList}
-        sessionStates={mux.sessions}
-        acks={acks}
-        activeWorkspaceId={activeWorkspaceId}
-        atlassianMeta={atlassianCreds.meta}
-        onSelect={(id) => setActiveWorkspaceId(id)}
-        onOpenCreate={() => setCreateModalOpen(true)}
-        onOpenInitiatives={() => setInitiativeModalOpen(true)}
-        onOpenArchive={() => setArchiveModalOpen(true)}
-        onOpenSettings={() => setSettingsModalOpen(true)}
-        onArchive={workspaces.archive}
-        onUnarchive={workspaces.unarchive}
-        onDelete={workspaces.remove}
-      />
+    <div className="flex h-[100dvh] bg-canvas text-ink">
+      {viewportShape !== "phone" && sidebarElement}
       <div className="flex-1 min-w-0 flex flex-col">
         {!workspaces.hydrated || !mux.hydrated ? (
           <LoadingState />
@@ -1004,6 +1291,7 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
             workspace={activeWorkspace}
             workspaceSessions={activeWorkspace.session_ids}
             onPickSession={(sid) => setActiveSessionByWs((p) => ({ ...p, [activeWorkspace.id]: sid }))}
+            onOpenSidebar={viewportShape === "phone" ? () => setSidebarOpen(true) : undefined}
             onSpawnSession={() => spawnSessionIntoWorkspace(activeWorkspace.id)}
             onRenameSession={(sid, name) => workspaces.renameSession(activeWorkspace.id, sid, name)}
             onDeleteSession={(sid) => deleteSessionFromWorkspace(activeWorkspace.id, sid)}
@@ -1020,7 +1308,7 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
       </div>
       <AnimatePresence>
         {createModalOpen && (
-          <Modal key="ws-create">
+          <Modal key="ws-create" onDismiss={() => setCreateModalOpen(false)}>
             <WorkspaceCreateModal
               baseUrl={baseUrl}
               initiatives={initiatives.list}
@@ -1036,7 +1324,7 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
           </Modal>
         )}
         {initiativeModalOpen && (
-          <Modal key="init-mgr">
+          <Modal key="init-mgr" onDismiss={() => setInitiativeModalOpen(false)}>
             <InitiativeManager
               baseUrl={baseUrl}
               initiatives={initiatives}
@@ -1045,7 +1333,7 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
           </Modal>
         )}
         {credsModalOpen && (
-          <Modal key="creds">
+          <Modal key="creds" onDismiss={() => setCredsModalOpen(false)}>
             <CredsModal
               creds={atlassianCreds}
               onClose={() => setCredsModalOpen(false)}
@@ -1053,7 +1341,7 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
           </Modal>
         )}
         {archiveModalOpen && (
-          <Modal key="archive">
+          <Modal key="archive" onDismiss={() => setArchiveModalOpen(false)}>
             <ArchiveModal
               workspaces={workspaces.list.filter((w) => w.archived_at !== null)}
               onRestore={async (id) => { await workspaces.unarchive(id); }}
@@ -1064,16 +1352,77 @@ export default function Chat({ baseUrl }: { baseUrl: string }) {
           </Modal>
         )}
         {settingsModalOpen && (
-          <Modal key="settings">
+          <Modal key="settings" onDismiss={() => setSettingsModalOpen(false)}>
             <SettingsModal
               settings={userSettings}
               creds={atlassianCreds}
+              lan={lanAccess}
               onClose={() => setSettingsModalOpen(false)}
             />
           </Modal>
         )}
+        {viewportShape === "phone" && sidebarOpen && (
+          <SidebarDrawer key="sidebar-drawer" onDismiss={() => setSidebarOpen(false)}>
+            {sidebarElement}
+          </SidebarDrawer>
+        )}
       </AnimatePresence>
     </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// SidebarDrawer — phone-only wrapper for TicketSidebar. Slides in from
+// the left, full-height. Backdrop click or Escape dismisses.
+// ────────────────────────────────────────────────────────────────────────────
+
+function SidebarDrawer({
+  children,
+  onDismiss,
+}: {
+  children: React.ReactNode;
+  onDismiss: () => void;
+}) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.stopPropagation(); onDismiss(); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onDismiss]);
+  if (!mounted || typeof document === "undefined") return null;
+  return createPortal(
+    <motion.div
+      className="fixed inset-0 z-30 flex bg-black/30"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.18, ease: EASE_OUT }}
+      onClick={(e) => { if (e.target === e.currentTarget) onDismiss(); }}
+    >
+      <motion.div
+        drag="x"
+        dragConstraints={{ left: 0, right: 0 }}
+        dragElastic={{ left: 0.4, right: 0 }}
+        onDragEnd={(_, info) => {
+          if (info.offset.x < -100 || info.velocity.x < -500) onDismiss();
+        }}
+        initial={{ x: "-100%" }}
+        animate={{ x: 0 }}
+        exit={{ x: "-100%" }}
+        transition={{ type: "spring", stiffness: 320, damping: 36 }}
+        // h-full + bg-canvas + flex so the inner TicketSidebar (which
+        // is flex-col but has no h-full of its own) stretches to fill
+        // the drawer — otherwise its content height leaves a visible
+        // transparent patch below.
+        className="h-full bg-canvas shadow-2xl flex"
+      >
+        {children}
+      </motion.div>
+    </motion.div>,
+    document.body
   );
 }
 
@@ -1243,6 +1592,7 @@ function ChatView({
   onSpawnSession,
   onRenameSession,
   onDeleteSession,
+  onOpenSidebar,
   onWorkspaceMaybeChanged,
   acks,
   completions,
@@ -1256,6 +1606,8 @@ function ChatView({
   onSpawnSession: () => Promise<string>;
   onRenameSession: (sid: string, name: string | null) => Promise<void>;
   onDeleteSession: (sid: string) => Promise<void>;
+  /** Phone-only: opens the sidebar drawer. */
+  onOpenSidebar?: () => void;
   /** Refetch workspaces; the docs.rfc/debrief refs change server-side when
    *  the agent writes those pages, and we need a fresh fetch to see them. */
   onWorkspaceMaybeChanged: () => void;
@@ -1278,6 +1630,7 @@ function ChatView({
     !session.pendingPermission &&
     !session.pendingQuestion;
   const onAcknowledge = useCallback(() => acks.acknowledge(sessionId), [acks, sessionId]);
+  const viewportShape = useViewportShape();
   const [input, setInput] = useState("");
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const items = useMemo(() => buildChatItems(session.messages), [session.messages]);
@@ -1442,6 +1795,11 @@ function ChatView({
         workspaceDir={workspace.dir}
         onPickSession={onPickSession}
         onSpawnSession={onSpawnSession}
+        viewportShape={viewportShape}
+        onOpenSidebar={onOpenSidebar}
+        onPickDoc={(target) => dispatchDocSlot({ type: "user_toggle", target })}
+        docSlotKind={docSlot.kind}
+        hasPlan={planText !== null}
         onRenameSession={onRenameSession}
         onDeleteSession={onDeleteSession}
       />
@@ -1536,7 +1894,10 @@ function ChatView({
       />
       </div>
       <AnimatePresence initial={false}>
-        {docSlot.kind !== "hidden" && (
+        {/* DocSlot rendering mode is viewport-driven. Desktop has the
+            real estate for an inline column; tablet and phone overlay
+            it as a bottom sheet (otherwise it'd squeeze chat to nothing). */}
+        {docSlot.kind !== "hidden" && viewportShape === "desktop" && (
           <DocSlotSidebar
             key={`docslot-${docSlot.kind}`}
             slot={docSlot}
@@ -1559,7 +1920,42 @@ function ChatView({
             }
           />
         )}
-        {(showTodos && todos) || workspace ? (
+        {docSlot.kind !== "hidden" && viewportShape !== "desktop" && (
+          <BottomSheet
+            key={`docslot-sheet-${docSlot.kind}`}
+            onDismiss={() => dispatchDocSlot({ type: "hide" })}
+            height={viewportShape === "phone" ? "92dvh" : "82dvh"}
+          >
+            <DocSlotSidebar
+              slot={docSlot}
+              workspace={workspace}
+              baseUrl={baseUrl}
+              ticketRefreshKey={ticketRefreshKey}
+              rfcRefreshKey={rfcRefreshKey}
+              debriefRefreshKey={debriefRefreshKey}
+              planText={planText}
+              pendingPlanApproval={pendingPlanApproval}
+              onClose={() => dispatchDocSlot({ type: "hide" })}
+              onApprovePlan={() =>
+                pendingPlanApproval && session.approve(pendingPlanApproval.correlation_id, {})
+              }
+              onDenyPlan={() =>
+                pendingPlanApproval &&
+                session.deny(pendingPlanApproval.correlation_id, {
+                  message: "User declined to approve this plan. Keep refining.",
+                })
+              }
+              embedded
+            />
+          </BottomSheet>
+        )}
+        {/* Chat workspaces only show the right rail when there's actually
+            a todo list — there are no docs to surface. Ticket workspaces
+            mount the rail unconditionally so the DocsPanel is always
+            reachable. Phone never shows the right rail (no horizontal
+            room); todos via a future strip + sheet. */}
+        {viewportShape !== "phone" &&
+         ((showTodos && todos) || (workspace && workspace.kind === "ticket")) ? (
           <RightRail
             key="right-rail"
             todos={showTodos ? todos : null}
@@ -1595,6 +1991,7 @@ function DocSlotSidebar({
   onClose,
   onApprovePlan,
   onDenyPlan,
+  embedded = false,
 }: {
   slot: DocSlotState;
   workspace: WorkspaceDTO;
@@ -1607,6 +2004,10 @@ function DocSlotSidebar({
   onClose: () => void;
   onApprovePlan: () => void;
   onDenyPlan: () => void;
+  /** When mounted inside a parent that already handles entrance + sizing
+   *  (e.g. BottomSheet on tablet/phone), suppress the inline aside's
+   *  own width animation and stretch to fill the host. */
+  embedded?: boolean;
 }) {
   if (slot.kind === "hidden") return null;
   if (slot.kind === "plan") {
@@ -1616,6 +2017,7 @@ function DocSlotSidebar({
         pendingApproval={pendingPlanApproval}
         onApprove={onApprovePlan}
         onDeny={onDenyPlan}
+        embedded={embedded}
       />
     );
   }
@@ -1626,6 +2028,7 @@ function DocSlotSidebar({
         ticketKey={slot.ticketKey}
         refreshKey={ticketRefreshKey}
         onClose={onClose}
+        embedded={embedded}
       />
     );
   }
@@ -1639,6 +2042,7 @@ function DocSlotSidebar({
       pageRef={ref}
       refreshKey={slot.kind === "rfc" ? rfcRefreshKey : debriefRefreshKey}
       onClose={onClose}
+      embedded={embedded}
     />
   );
 }
@@ -1656,6 +2060,7 @@ function DocChrome({
   externalUrl,
   onClose,
   children,
+  embedded = false,
 }: {
   kind: "ticket" | "rfc" | "debrief";
   title: string;
@@ -1664,16 +2069,23 @@ function DocChrome({
   externalUrl?: string | null;
   onClose: () => void;
   children: React.ReactNode;
+  /** When true, drop the width animation + left border (the host
+   *  BottomSheet provides those). */
+  embedded?: boolean;
 }) {
   const accent =
     kind === "ticket" ? "var(--accent-warm)" : kind === "rfc" ? "var(--accent-cool)" : "var(--accent-ok)";
   return (
     <motion.aside
-      initial={{ width: 0, opacity: 0 }}
-      animate={{ width: 630, opacity: 1 }}
-      exit={{ width: 0, opacity: 0 }}
+      initial={embedded ? false : { width: 0, opacity: 0 }}
+      animate={embedded ? { opacity: 1 } : { width: 630, opacity: 1 }}
+      exit={embedded ? { opacity: 0 } : { width: 0, opacity: 0 }}
       transition={{ duration: 0.24, ease: EASE_OUT }}
-      className="shrink-0 border-l border-line bg-canvas overflow-hidden flex flex-col min-h-0"
+      className={
+        embedded
+          ? "w-full h-full bg-canvas overflow-hidden flex flex-col min-h-0"
+          : "shrink-0 border-l border-line bg-canvas overflow-hidden flex flex-col min-h-0"
+      }
     >
       <div
         className="px-4 py-3 border-b border-line flex items-start justify-between gap-3 shrink-0"
@@ -1795,7 +2207,7 @@ function useTicketBody(baseUrl: string, key: string, externalRefreshKey: number)
   return { state, reload: () => setTick((t) => t + 1) };
 }
 
-function TicketViewer({ baseUrl, ticketKey, refreshKey, onClose }: { baseUrl: string; ticketKey: string; refreshKey: number; onClose: () => void }) {
+function TicketViewer({ baseUrl, ticketKey, refreshKey, onClose, embedded = false }: { baseUrl: string; ticketKey: string; refreshKey: number; onClose: () => void; embedded?: boolean }) {
   const { state, reload } = useTicketBody(baseUrl, ticketKey, refreshKey);
   const ok = state.kind === "ok" ? state.value : null;
 
@@ -1825,6 +2237,7 @@ function TicketViewer({ baseUrl, ticketKey, refreshKey, onClose }: { baseUrl: st
       }
       externalUrl={ok?.url ?? null}
       onClose={onClose}
+      embedded={embedded}
     >
       <ViewerBody state={state}>
         {bodyMarkdown ? (
@@ -1898,6 +2311,7 @@ function ConfluencePageViewer({
   pageRef,
   refreshKey,
   onClose,
+  embedded = false,
 }: {
   baseUrl: string;
   kind: "rfc" | "debrief";
@@ -1905,6 +2319,7 @@ function ConfluencePageViewer({
   pageRef: WorkspaceDocRefDTO | undefined;
   refreshKey: number;
   onClose: () => void;
+  embedded?: boolean;
 }) {
   const pageId = pageRef?.page_id ?? null;
   const state = usePageBody(baseUrl, pageId, refreshKey);
@@ -1919,6 +2334,7 @@ function ConfluencePageViewer({
         title={`No ${label} yet`}
         subtitle={workspace.ticket_key}
         onClose={onClose}
+        embedded={embedded}
       >
         <div className="px-5 py-6 text-[13px] text-ink-muted leading-relaxed">
           The agent will create the {label} as a child of this initiative's
@@ -1948,6 +2364,7 @@ function ConfluencePageViewer({
       }
       externalUrl={ok?.url ?? pageRef?.url ?? null}
       onClose={onClose}
+      embedded={embedded}
     >
       <ViewerBody state={state}>
         <ConfluencePageBodyRenderer body={ok?.body_adf} url={ok?.url ?? null} />
@@ -2156,14 +2573,116 @@ function RightRail({
       className="shrink-0 border-l border-line bg-canvas overflow-hidden flex flex-col min-h-0"
     >
       {todos && todos.length > 0 && <TodoSidebarBody todos={todos} />}
-      <DocsPanel
-        workspace={workspace}
-        docSlot={docSlot}
-        hasPlan={hasPlan}
-        planLocked={planLocked}
-        onPick={onPickDoc}
-      />
+      {/* DocsPanel is workflow-specific (Plan / Ticket / RFC / Debrief).
+          Chat workspaces don't have a ticket or pages, so we skip it. */}
+      {workspace.kind === "ticket" && (
+        <DocsPanel
+          workspace={workspace}
+          docSlot={docSlot}
+          hasPlan={hasPlan}
+          planLocked={planLocked}
+          onPick={onPickDoc}
+        />
+      )}
     </motion.aside>
+  );
+}
+
+// Phone-only header button that surfaces the doc-tile choices. The
+// large DocsPanel column doesn't exist on phone, so this is the only
+// way to open Ticket / RFC / Debrief / Plan as a bottom sheet.
+function DocsButton({
+  workspace,
+  docSlotKind,
+  hasPlan,
+  onPick,
+}: {
+  workspace: WorkspaceDTO;
+  docSlotKind: DocSlotState["kind"];
+  hasPlan: boolean;
+  onPick: (target: DocPickTarget) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const rfcRef = workspace.docs?.rfc;
+  const debriefRef = workspace.docs?.debrief;
+  const items: { key: DocSlotState["kind"]; label: string; meta: string; target: DocPickTarget; accent: string }[] = [
+    { key: "ticket", label: "Ticket", meta: workspace.ticket_key, target: { kind: "ticket", ticketKey: workspace.ticket_key }, accent: "var(--accent-warm)" },
+    { key: "rfc", label: "RFC", meta: rfcRef?.page_id ? `v${rfcRef.version ?? "?"}` : "not yet", target: { kind: "rfc", workspaceId: workspace.id }, accent: "var(--accent-cool)" },
+    { key: "debrief", label: "Debrief", meta: debriefRef?.page_id ? `v${debriefRef.version ?? "?"}` : "not yet", target: { kind: "debrief", workspaceId: workspace.id }, accent: "var(--accent-ok)" },
+  ];
+  if (hasPlan) {
+    items.unshift({ key: "plan", label: "Plan", meta: "current", target: { kind: "plan" }, accent: "var(--accent-cool)" });
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <motion.button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        whileTap={{ scale: 0.94 }}
+        transition={{ duration: 0.12, ease: EASE_OUT }}
+        className={`size-9 grid place-items-center rounded-md transition-colors ${
+          docSlotKind !== "hidden"
+            ? "bg-surface-tinted text-ink"
+            : "text-ink-soft hover:text-ink hover:bg-surface-sunk"
+        }`}
+        aria-label="Documents"
+        title="Documents"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden>
+          <path d="M3.5 2h5l2.5 2.5V12H3.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+          <path d="M5 6h4M5 8.5h4M5 11h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+        </svg>
+      </motion.button>
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -4, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -2, scale: 0.98 }}
+            transition={{ duration: 0.14, ease: EASE_OUT }}
+            className="absolute right-0 mt-1 w-[220px] z-50 rounded-md border border-line bg-canvas shadow-xl overflow-hidden origin-top-right"
+            role="menu"
+          >
+            {items.map((it) => {
+              const active = docSlotKind === it.key;
+              return (
+                <button
+                  key={it.key}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { onPick(it.target); setOpen(false); }}
+                  className={`w-full text-left px-3 py-2.5 flex items-center gap-2.5 transition-colors ${
+                    active ? "bg-surface-tinted" : "hover:bg-surface-sunk"
+                  }`}
+                >
+                  <span className="inline-block size-1.5 rounded-full shrink-0" style={{ background: it.accent }} aria-hidden />
+                  <span className="text-[13px] text-ink flex-1">{it.label}</span>
+                  <span className="text-[10px] font-mono text-ink-faint">{it.meta}</span>
+                </button>
+              );
+            })}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   );
 }
 
@@ -2275,19 +2794,25 @@ function PlanSidebar({
   pendingApproval,
   onApprove,
   onDeny,
+  embedded = false,
 }: {
   plan: string | null;
   pendingApproval: { correlation_id: string } | null;
   onApprove: () => void;
   onDeny: () => void;
+  embedded?: boolean;
 }) {
   return (
     <motion.aside
-      initial={{ width: 0, opacity: 0 }}
-      animate={{ width: 630, opacity: 1 }}
-      exit={{ width: 0, opacity: 0 }}
+      initial={embedded ? false : { width: 0, opacity: 0 }}
+      animate={embedded ? { opacity: 1 } : { width: 630, opacity: 1 }}
+      exit={embedded ? { opacity: 0 } : { width: 0, opacity: 0 }}
       transition={{ duration: 0.24, ease: EASE_OUT }}
-      className="shrink-0 border-l border-line bg-canvas overflow-hidden flex flex-col min-h-0"
+      className={
+        embedded
+          ? "w-full h-full bg-canvas overflow-hidden flex flex-col min-h-0"
+          : "shrink-0 border-l border-line bg-canvas overflow-hidden flex flex-col min-h-0"
+      }
     >
       <div className="px-4 py-3 border-b border-line flex items-baseline justify-between shrink-0">
         <span className="text-[11px] uppercase tracking-[0.14em] font-mono" style={{ color: "var(--accent-cool)" }}>
@@ -2478,7 +3003,7 @@ function Sidebar({
         </motion.button>
         <AnimatePresence>
           {pickerOpen && (
-            <Modal>
+            <Modal onDismiss={() => setPickerOpen(false)}>
               <FolderPicker
                 baseUrl={baseUrl}
                 onPick={(p) => {
@@ -2714,6 +3239,8 @@ function TicketSidebar({
   atlassianMeta,
   onSelect,
   onOpenCreate,
+  onOpenChat,
+  creatingChat,
   onOpenInitiatives,
   onOpenArchive,
   onOpenSettings,
@@ -2730,6 +3257,8 @@ function TicketSidebar({
   atlassianMeta: AtlassianCredsMeta;
   onSelect: (id: string) => void;
   onOpenCreate: () => void;
+  onOpenChat: () => void;
+  creatingChat: boolean;
   onOpenInitiatives: () => void;
   onOpenArchive: () => void;
   onOpenSettings: () => void;
@@ -2795,6 +3324,20 @@ function TicketSidebar({
             <path d="M5 1V9M1 5H9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
           </svg>
           Add ticket
+        </motion.button>
+        <motion.button
+          type="button"
+          onClick={onOpenChat}
+          disabled={creatingChat}
+          whileTap={{ scale: 0.97 }}
+          transition={{ duration: 0.12, ease: EASE_OUT }}
+          className="mt-1.5 w-full px-3 py-1.5 rounded-md text-[12px] font-medium text-ink-soft hover:text-ink hover:bg-surface-sunk transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-default"
+          title="Spawn a chat-only agent with access to JIRA + app settings"
+        >
+          <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden>
+            <path d="M1.5 2.5h9v6h-5l-2.5 2v-2h-1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+          </svg>
+          {creatingChat ? "Starting…" : "New chat"}
         </motion.button>
       </div>
 
@@ -2944,16 +3487,31 @@ function TicketRow({
     >
       <button type="button" onClick={onSelect} className="w-full text-left px-2.5 py-2 pr-9">
         <div className="flex items-baseline gap-1.5">
-          <span className="font-mono text-[11px] text-ink-soft">{workspace.ticket_key}</span>
+          {workspace.kind === "chat" ? (
+            <span className="inline-flex items-center gap-1 text-[10px] font-mono uppercase tracking-[0.14em] text-ink-faint">
+              <svg width="9" height="9" viewBox="0 0 12 12" fill="none" aria-hidden>
+                <path d="M1.5 2.5h9v6h-5l-2.5 2v-2h-1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+              </svg>
+              chat
+            </span>
+          ) : (
+            <span className="font-mono text-[11px] text-ink-soft">{workspace.ticket_key}</span>
+          )}
           {status !== "idle" && <StatusPipDot status={status} />}
         </div>
         <div className="text-[13px] text-ink leading-tight truncate mt-0.5">
           {workspace.ticket_title || (
-            <span className="italic text-ink-faint">untitled</span>
+            <span className="italic text-ink-faint">
+              {workspace.kind === "chat" ? "untitled chat" : "untitled"}
+            </span>
           )}
         </div>
         <div className="text-[10px] font-mono text-ink-faint truncate mt-0.5">
-          {workspace.repos.length} repo{workspace.repos.length === 1 ? "" : "s"} ·{" "}
+          {workspace.kind === "ticket" && (
+            <>
+              {workspace.repos.length} repo{workspace.repos.length === 1 ? "" : "s"} ·{" "}
+            </>
+          )}
           {workspace.session_ids.length} session{workspace.session_ids.length === 1 ? "" : "s"}
         </div>
       </button>
@@ -3012,7 +3570,10 @@ function TicketRow({
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (confirm(`Delete workspace for ${workspace.ticket_key}? This removes worktrees and the workspace dir.`)) {
+                  const label = workspace.kind === "chat"
+                    ? `chat "${workspace.ticket_title || "untitled"}"`
+                    : workspace.ticket_key;
+                  if (confirm(`Delete ${label}? This removes worktrees and the workspace dir.`)) {
                     void onDelete();
                   }
                   setMenuOpen(false);
@@ -3261,7 +3822,7 @@ function WorkspaceCreateModal({
       </div>
       <AnimatePresence>
         {pickerOpen && (
-          <Modal>
+          <Modal onDismiss={() => setPickerOpen(false)}>
             <FolderPicker
               baseUrl={baseUrl}
               onPick={(p) => {
@@ -3993,11 +4554,12 @@ function ArchiveModal({
 // before the round-trip so toggles feel instant.
 // ────────────────────────────────────────────────────────────────────────────
 
-type SettingsCategory = "appearance" | "atlassian";
+type SettingsCategory = "appearance" | "atlassian" | "network";
 
 const SETTINGS_CATEGORIES: { key: SettingsCategory; label: string; description: string }[] = [
   { key: "appearance", label: "Appearance", description: "Theme, density, typography" },
   { key: "atlassian", label: "Atlassian", description: "JIRA + Confluence credentials" },
+  { key: "network", label: "Network", description: "Phone access over LAN" },
   // Future: { key: "workspaces", label: "Workspaces", description: "Defaults for new tickets" },
   // Future: { key: "agent", label: "Agent", description: "Permission mode defaults, model" },
 ];
@@ -4005,11 +4567,13 @@ const SETTINGS_CATEGORIES: { key: SettingsCategory; label: string; description: 
 function SettingsModal({
   settings,
   creds,
+  lan,
   initialCategory,
   onClose,
 }: {
   settings: UseSettings;
   creds: UseAtlassianCreds;
+  lan: UseLanAccess;
   initialCategory?: SettingsCategory;
   onClose: () => void;
 }) {
@@ -4042,7 +4606,11 @@ function SettingsModal({
                   ? creds.meta.has_creds
                     ? "var(--accent-ok)"
                     : "var(--accent-warn)"
-                  : null;
+                  : c.key === "network"
+                    ? lan.meta.enabled
+                      ? "var(--accent-ok)"
+                      : null
+                    : null;
               return (
                 <li key={c.key}>
                   <button
@@ -4079,6 +4647,9 @@ function SettingsModal({
           {active === "atlassian" && (
             <AtlassianSettings creds={creds} />
           )}
+          {active === "network" && (
+            <NetworkSettings lan={lan} />
+          )}
         </div>
       </div>
       <div className="px-5 py-2.5 border-t border-line shrink-0 text-[10px] text-ink-faint flex items-center justify-end">
@@ -4108,6 +4679,322 @@ function AppearanceSettings({ settings }: { settings: UseSettings }) {
         </SettingRow>
       </div>
     </section>
+  );
+}
+
+function NetworkSettings({ lan }: { lan: UseLanAccess }) {
+  return (
+    <section>
+      <div className="flex items-baseline justify-between gap-4">
+        <div>
+          <h2 className="font-serif text-2xl text-ink leading-tight tracking-tight">Network</h2>
+          <p className="mt-1 text-[13px] text-ink-muted">
+            Reach this blitzcode workspace from your phone, your other devices, or anywhere on the internet.
+          </p>
+        </div>
+      </div>
+      <div className="mt-6 space-y-8">
+        <LanCard lan={lan} />
+        <div className="border-t border-line" />
+        <TunnelCard lan={lan} />
+      </div>
+    </section>
+  );
+}
+
+function useQrDataUrl(value: string | null): string | null {
+  const [qr, setQr] = useState<string | null>(null);
+  useEffect(() => {
+    if (!value) { setQr(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const QRCode = (await import("qrcode")).default;
+        const dataUrl = await QRCode.toDataURL(value, {
+          width: 240,
+          margin: 1,
+          color: { dark: "#1a1a19", light: "#fbfbfa" },
+        });
+        if (!cancelled) setQr(dataUrl);
+      } catch {
+        if (!cancelled) setQr(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [value]);
+  return qr;
+}
+
+function LanCard({ lan }: { lan: UseLanAccess }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const url = lan.meta.lan_urls[0] ?? null;
+  const qr = useQrDataUrl(lan.meta.enabled ? url : null);
+  const toggle = async () => {
+    setBusy(true); setErr(null);
+    try { await lan.toggle(!lan.meta.enabled); }
+    catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-3">
+        <div>
+          <div className="text-[15px] text-ink font-medium">LAN access</div>
+          <p className="mt-0.5 text-[12px] text-ink-muted leading-relaxed max-w-[420px]">
+            {lan.meta.enabled
+              ? "Anyone on this network with the URL becomes a trusted client. Disable when you leave the network."
+              : "Listen on this machine's LAN interface. Connections need the token in the URL."}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <ConnectionPill connected={lan.meta.enabled} />
+          <motion.button
+            type="button"
+            onClick={() => void toggle()}
+            disabled={busy}
+            whileTap={{ scale: 0.97 }}
+            transition={{ duration: 0.12, ease: EASE_OUT }}
+            className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors disabled:opacity-50 ${
+              lan.meta.enabled
+                ? "bg-surface-tinted text-ink-soft hover:text-ink border border-line"
+                : "bg-ink text-canvas dark:bg-surface-tinted dark:text-ink-soft dark:hover:text-ink dark:border dark:border-line"
+            }`}
+          >
+            {busy ? "…" : lan.meta.enabled ? "Disable" : "Enable"}
+          </motion.button>
+        </div>
+      </div>
+      {lan.meta.enabled && url && (
+        <UrlWithQr label="URL" url={url} qr={qr} />
+      )}
+      {lan.meta.enabled && !url && (
+        <div className="mt-4 px-3 py-2 rounded-md bg-[color:var(--tint-warn)] text-[color:var(--accent-warn)] text-[12px]">
+          Couldn't determine this machine's LAN address (no active network?).
+        </div>
+      )}
+      {err && (
+        <div className="mt-3 px-3 py-2 rounded-md bg-[color:var(--tint-err)] text-[color:var(--accent-err)] text-[12px] font-mono">
+          {err}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TunnelCard({ lan }: { lan: UseLanAccess }) {
+  const tunnel = lan.meta.tunnel;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [tokenInput, setTokenInput] = useState("");
+  const publicUrl = tunnel.public_join_url ?? null;
+  const qr = useQrDataUrl(tunnel.state === "on" ? publicUrl : null);
+
+  const saveAuthtoken = async () => {
+    if (!tokenInput.trim()) return;
+    setBusy(true); setErr(null);
+    try { await lan.setNgrokAuthtoken(tokenInput.trim()); setTokenInput(""); }
+    catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const clearAuthtoken = async () => {
+    if (!confirm("Forget the ngrok authtoken? Active tunnel will be stopped.")) return;
+    setBusy(true); setErr(null);
+    try { await lan.clearNgrokAuthtoken(); }
+    catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const toggleTunnel = async () => {
+    setBusy(true); setErr(null);
+    try { await lan.toggleTunnel(tunnel.state !== "on"); }
+    catch (e) {
+      // Surface backend errors verbatim (often "auth required" / "tunnel session failed").
+      const raw = e instanceof Error ? e.message : String(e);
+      try {
+        const parsed = JSON.parse(raw);
+        setErr(parsed?.detail?.message || raw);
+      } catch { setErr(raw); }
+    }
+    finally { setBusy(false); }
+  };
+
+  const stateColor: Record<TunnelMeta["state"], string> = {
+    off: "var(--ink-faint)",
+    starting: "var(--accent-warn)",
+    on: "var(--accent-ok)",
+    error: "var(--accent-err)",
+  };
+
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-3">
+        <div>
+          <div className="text-[15px] text-ink font-medium">Public tunnel (ngrok)</div>
+          <p className="mt-0.5 text-[12px] text-ink-muted leading-relaxed max-w-[420px]">
+            Forward your LAN URL through ngrok so it's reachable from cellular, a different office, or anywhere on the internet.
+            The auth token still gates every request.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span
+            className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-[0.14em]"
+            style={{
+              background: tunnel.state === "on"
+                ? "var(--tint-ok)"
+                : tunnel.state === "error"
+                  ? "var(--tint-err)"
+                  : tunnel.state === "starting"
+                    ? "var(--tint-warn)"
+                    : "var(--surface-sunk)",
+              color: stateColor[tunnel.state],
+            }}
+          >
+            <span
+              className="inline-block size-1.5 rounded-full"
+              style={{ background: stateColor[tunnel.state] }}
+              aria-hidden
+            />
+            {tunnel.state}
+          </span>
+          <motion.button
+            type="button"
+            onClick={() => void toggleTunnel()}
+            disabled={busy || !tunnel.configured}
+            whileTap={{ scale: 0.97 }}
+            transition={{ duration: 0.12, ease: EASE_OUT }}
+            className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors disabled:opacity-50 ${
+              tunnel.state === "on"
+                ? "bg-surface-tinted text-ink-soft hover:text-ink border border-line"
+                : "bg-ink text-canvas dark:bg-surface-tinted dark:text-ink-soft dark:hover:text-ink dark:border dark:border-line"
+            }`}
+            title={!tunnel.configured ? "Configure the ngrok authtoken first" : undefined}
+          >
+            {busy ? "…" : tunnel.state === "on" ? "Disable" : "Enable"}
+          </motion.button>
+        </div>
+      </div>
+
+      {/* Authtoken management */}
+      <div className="mt-4">
+        <div className="text-[11px] font-mono uppercase tracking-[0.14em] text-ink-faint mb-1.5">
+          ngrok authtoken
+        </div>
+        {tunnel.configured ? (
+          <div className="flex items-center gap-2">
+            <code className="flex-1 px-3 py-2 rounded-md border border-line bg-surface text-ink-soft text-[12px] font-mono">
+              configured (hidden)
+            </code>
+            <button
+              type="button"
+              onClick={() => void clearAuthtoken()}
+              disabled={busy}
+              className="shrink-0 px-3 py-2 rounded-md text-[12px] text-[color:var(--accent-err)] hover:bg-[color:var(--tint-err)] transition-colors disabled:opacity-50"
+            >
+              Forget
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <input
+              type="password"
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              placeholder="2abc... (paste from ngrok dashboard)"
+              className="flex-1 min-w-0 px-3 py-2 rounded-md border border-line bg-surface text-ink text-[12px] font-mono focus:outline-none focus:border-line-strong"
+            />
+            <motion.button
+              type="button"
+              onClick={() => void saveAuthtoken()}
+              disabled={busy || !tokenInput.trim()}
+              whileTap={{ scale: 0.97 }}
+              transition={{ duration: 0.12, ease: EASE_OUT }}
+              className="shrink-0 px-3 py-2 rounded-md text-[12px] bg-ink text-canvas dark:bg-surface-tinted dark:text-ink-soft dark:hover:text-ink dark:border dark:border-line transition-colors disabled:opacity-50"
+            >
+              Save
+            </motion.button>
+          </div>
+        )}
+        <p className="mt-1.5 text-[11px] text-ink-faint leading-relaxed">
+          Free token at{" "}
+          <a
+            href="https://dashboard.ngrok.com/get-started/your-authtoken"
+            target="_blank"
+            rel="noreferrer"
+            className="text-[color:var(--accent-cool)] hover:underline"
+          >
+            dashboard.ngrok.com/get-started/your-authtoken ↗
+          </a>
+          . Stored locally (chmod 0600), never sent anywhere except to ngrok.
+        </p>
+      </div>
+
+      {tunnel.state === "on" && publicUrl && (
+        <UrlWithQr label="Public URL" url={publicUrl} qr={qr} />
+      )}
+
+      {tunnel.state === "on" && (
+        <div className="mt-3 px-3 py-2 rounded-md bg-[color:var(--tint-warn)] text-[color:var(--accent-warn)] text-[11px] leading-relaxed">
+          ⚠ Anyone with this URL + token can reach your workspace from anywhere
+          on the internet. On free ngrok plans the first visit shows an
+          interstitial — tap "Visit Site" to continue. Disable the tunnel
+          when done.
+        </div>
+      )}
+
+      {tunnel.state === "error" && tunnel.error && (
+        <div className="mt-3 px-3 py-2 rounded-md bg-[color:var(--tint-err)] text-[color:var(--accent-err)] text-[12px] font-mono">
+          {tunnel.error}
+        </div>
+      )}
+
+      {err && (
+        <div className="mt-3 px-3 py-2 rounded-md bg-[color:var(--tint-err)] text-[color:var(--accent-err)] text-[12px] font-mono">
+          {err}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Shared URL + QR + Copy block used by both LAN and Tunnel cards.
+function UrlWithQr({ label, url, qr }: { label: string; url: string; qr: string | null }) {
+  return (
+    <div className="mt-4 flex items-start gap-4">
+      <div className="flex-1 min-w-0">
+        <div className="text-[11px] font-mono uppercase tracking-[0.14em] text-ink-faint mb-1.5">
+          {label}
+        </div>
+        <div className="flex items-center gap-2">
+          <code className="flex-1 min-w-0 truncate px-3 py-2 rounded-md border border-line bg-surface text-ink text-[12px] font-mono">
+            {url}
+          </code>
+          <motion.button
+            type="button"
+            onClick={() => void navigator.clipboard.writeText(url)}
+            whileTap={{ scale: 0.97 }}
+            transition={{ duration: 0.12, ease: EASE_OUT }}
+            className="shrink-0 px-3 py-2 rounded-md text-[12px] border border-line text-ink-soft hover:text-ink hover:bg-surface-sunk transition-colors"
+            title="Copy URL"
+          >
+            Copy
+          </motion.button>
+        </div>
+      </div>
+      {qr && (
+        <div className="shrink-0">
+          <div className="text-[11px] font-mono uppercase tracking-[0.14em] text-ink-faint mb-1.5 text-center">
+            Scan
+          </div>
+          <img
+            src={qr}
+            alt={`${label} QR code`}
+            width={140}
+            height={140}
+            className="rounded-md border border-line bg-canvas p-2"
+          />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -4600,6 +5487,11 @@ function Header({
   onSpawnSession,
   onRenameSession,
   onDeleteSession,
+  viewportShape,
+  onOpenSidebar,
+  onPickDoc,
+  docSlotKind,
+  hasPlan,
 }: {
   status: string;
   sessionId?: string;
@@ -4615,30 +5507,88 @@ function Header({
   onSpawnSession?: () => Promise<string>;
   onRenameSession?: (sid: string, name: string | null) => Promise<void>;
   onDeleteSession?: (sid: string) => Promise<void>;
+  viewportShape: ViewportShape;
+  /** Phone-only: opens the sidebar drawer. Absent on tablet/desktop. */
+  onOpenSidebar?: () => void;
+  /** Phone-only: opens a doc tile. Ticket workspaces only. */
+  onPickDoc?: (target: DocPickTarget) => void;
+  docSlotKind?: DocSlotState["kind"];
+  hasPlan?: boolean;
 }) {
+  const isPhone = viewportShape === "phone";
   return (
     <header
       className="border-b border-line bg-canvas/80 backdrop-blur-sm"
       data-tauri-drag-region
     >
       <div
-        className="mx-auto w-full max-w-2xl px-6 h-14 flex items-center justify-between gap-4"
+        className={
+          isPhone
+            ? "w-full px-3 h-12 flex items-center gap-2"
+            : "mx-auto w-full max-w-2xl px-6 h-14 flex items-center justify-between gap-4"
+        }
         data-tauri-drag-region
       >
+        {isPhone && onOpenSidebar && (
+          <motion.button
+            type="button"
+            onClick={onOpenSidebar}
+            whileTap={{ scale: 0.92 }}
+            transition={{ duration: 0.12, ease: EASE_OUT }}
+            className="shrink-0 size-9 grid place-items-center rounded-md text-ink-soft hover:text-ink hover:bg-surface-sunk transition-colors"
+            aria-label="Open sidebar"
+            title="Open sidebar"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden>
+              <path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            </svg>
+          </motion.button>
+        )}
         <div className="flex items-center gap-3 min-w-0 flex-1">
-          {workspace && (
-            <div className="flex items-baseline gap-2 shrink-0">
-              <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink">
-                {workspace.ticket_key}
-              </span>
-              {workspace.ticket_title && (
-                <span className="text-[12px] text-ink-muted truncate max-w-[200px]" title={workspace.ticket_title}>
-                  {workspace.ticket_title}
+          {workspace && !isPhone && (
+            workspace.kind === "chat" ? (
+              <div className="flex items-baseline gap-2 min-w-0">
+                <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-ink-faint shrink-0">
+                  chat
                 </span>
-              )}
-            </div>
+                <span className="text-[12px] text-ink truncate max-w-[260px]" title={workspace.ticket_title ?? ""}>
+                  {workspace.ticket_title || "untitled chat"}
+                </span>
+              </div>
+            ) : (
+              <div className="flex items-baseline gap-2 min-w-0">
+                <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink shrink-0">
+                  {workspace.ticket_key}
+                </span>
+                {workspace.ticket_title && (
+                  <span className="text-[12px] text-ink-muted truncate max-w-[200px]" title={workspace.ticket_title}>
+                    {workspace.ticket_title}
+                  </span>
+                )}
+              </div>
+            )
           )}
-          {workspaceSessions && workspaceSessions.length > 0 && (
+          {/* On phone the workspace title IS the session-picker trigger
+              — keeps the header to a single semantic button per side. */}
+          {workspace && isPhone && workspaceSessions && (
+            <SessionPickerButton
+              sessionIds={workspaceSessions}
+              activeId={sessionId ?? null}
+              sessionNames={sessionNames ?? {}}
+              sessionStates={sessionStates ?? {}}
+              onPick={onPickSession ?? (() => {})}
+              onSpawn={onSpawnSession}
+              triggerLabel={
+                workspace.kind === "chat"
+                  ? (workspace.ticket_title || "untitled chat")
+                  : workspace.ticket_key
+              }
+              triggerSecondary={
+                workspace.kind === "ticket" ? (workspace.ticket_title ?? undefined) : undefined
+              }
+            />
+          )}
+          {!isPhone && workspaceSessions && workspaceSessions.length > 0 && (
             <SessionTabs
               sessionIds={workspaceSessions}
               activeId={sessionId ?? null}
@@ -4653,7 +5603,15 @@ function Header({
             />
           )}
         </div>
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
+          {isPhone && workspace?.kind === "ticket" && onPickDoc && (
+            <DocsButton
+              workspace={workspace}
+              docSlotKind={docSlotKind ?? "hidden"}
+              hasPlan={!!hasPlan}
+              onPick={onPickDoc}
+            />
+          )}
           {onChangeMode && (
             <PermissionModeMenu mode={permissionMode ?? "default"} onChange={onChangeMode} />
           )}
@@ -4661,6 +5619,138 @@ function Header({
         </div>
       </div>
     </header>
+  );
+}
+
+// Compact session picker for the phone header. Shows "S1 ▾" with the
+// current session's status dot; tap → popover list with status dots +
+// a "+" entry to spawn another session.
+function SessionPickerButton({
+  sessionIds,
+  activeId,
+  sessionNames,
+  sessionStates,
+  onPick,
+  onSpawn,
+  triggerLabel,
+  triggerSecondary,
+}: {
+  sessionIds: string[];
+  activeId: string | null;
+  sessionNames: Record<string, string>;
+  sessionStates: AgentMux["sessions"];
+  onPick: (sid: string) => void;
+  onSpawn?: () => Promise<string>;
+  /** Optional custom trigger text (e.g. the workspace title on phone).
+   *  Defaults to the active session's label. */
+  triggerLabel?: string;
+  /** Optional muted secondary line under the label (e.g. ticket title). */
+  triggerSecondary?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  const labelFor = (sid: string, i: number) => sessionNames[sid]?.trim() || `S${i + 1}`;
+  const activeIdx = activeId ? sessionIds.indexOf(activeId) : -1;
+  const activeLabel = activeId && activeIdx >= 0 ? labelFor(activeId, activeIdx) : "—";
+  const labelText = triggerLabel ?? activeLabel;
+  return (
+    <div ref={ref} className="relative min-w-0">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={`flex items-center gap-1.5 px-2 py-1 rounded-md hover:bg-surface-sunk transition-colors min-w-0 ${
+          triggerLabel
+            ? "text-ink"
+            : "text-ink-soft hover:text-ink text-[11px] font-mono"
+        }`}
+        aria-label="Sessions"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        {triggerLabel ? (
+          <span className="flex items-baseline gap-1.5 min-w-0">
+            <span className="text-[13px] text-ink truncate">{labelText}</span>
+            {triggerSecondary && (
+              <span className="text-[11px] text-ink-muted truncate max-w-[120px]">{triggerSecondary}</span>
+            )}
+          </span>
+        ) : (
+          <span className="truncate max-w-[90px]">{labelText}</span>
+        )}
+        <svg width="8" height="8" viewBox="0 0 7 7" fill="none" aria-hidden className="shrink-0 text-ink-faint">
+          <path d="M1 2L3.5 5L6 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -4, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -2, scale: 0.98 }}
+            transition={{ duration: 0.14, ease: EASE_OUT }}
+            className="absolute right-0 mt-1 w-[200px] z-50 rounded-md border border-line bg-canvas shadow-xl overflow-hidden origin-top-right"
+            role="menu"
+          >
+            {sessionIds.map((sid, i) => {
+              const state = sessionStates[sid];
+              const sStatus = state?.status ?? "idle";
+              const dot =
+                sStatus === "streaming" || sStatus === "awaiting_hook"
+                  ? "var(--accent-warm)"
+                  : sStatus === "awaiting_permission" || sStatus === "awaiting_question"
+                    ? "var(--accent-cool)"
+                    : sStatus === "error"
+                      ? "var(--accent-err)"
+                      : "var(--ink-faint)";
+              const isActive = sid === activeId;
+              return (
+                <button
+                  key={sid}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { onPick(sid); setOpen(false); }}
+                  className={`w-full text-left px-3 py-2 flex items-center gap-2 transition-colors ${isActive ? "bg-surface-tinted" : "hover:bg-surface-sunk"}`}
+                >
+                  <span className="inline-block size-1.5 rounded-full shrink-0" style={{ background: dot }} aria-hidden />
+                  <span className="text-[12px] font-mono text-ink truncate">{labelFor(sid, i)}</span>
+                </button>
+              );
+            })}
+            {onSpawn && (
+              <>
+                <div className="h-px bg-line/70" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { void onSpawn(); setOpen(false); }}
+                  className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-surface-sunk transition-colors"
+                >
+                  <span className="size-3.5 grid place-items-center text-ink-faint shrink-0">
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden>
+                      <path d="M5 1V9M1 5H9" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                    </svg>
+                  </span>
+                  <span className="text-[12px] text-ink-soft">New session</span>
+                </button>
+              </>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   );
 }
 
@@ -4758,7 +5848,7 @@ function SessionTabs({
 
       <AnimatePresence>
         {renameTarget && onRename && (
-          <Modal key="rename-session">
+          <Modal key="rename-session" onDismiss={() => setRenameTarget(null)}>
             <SessionRenameModal
               currentName={sessionNames[renameTarget] ?? ""}
               fallbackLabel={(() => {
@@ -4774,7 +5864,7 @@ function SessionTabs({
           </Modal>
         )}
         {deleteTarget && onDelete && (
-          <Modal key="delete-session">
+          <Modal key="delete-session" onDismiss={() => setDeleteTarget(null)}>
             <SessionDeleteConfirm
               label={(() => {
                 const name = sessionNames[deleteTarget];
@@ -5092,7 +6182,10 @@ function SessionRenameModal({
   };
 
   return (
-    <div className="rounded-2xl bg-canvas border border-line shadow-2xl overflow-hidden">
+    <div
+      className="rounded-2xl bg-canvas border border-line shadow-2xl overflow-hidden"
+      style={{ width: "min(440px, 92vw)" }}
+    >
       <form
         onSubmit={(e) => { e.preventDefault(); void submit(value.trim() || null); }}
         className="p-5"
@@ -5164,7 +6257,10 @@ function SessionDeleteConfirm({
   };
 
   return (
-    <div className="rounded-2xl bg-canvas border border-line shadow-2xl overflow-hidden">
+    <div
+      className="rounded-2xl bg-canvas border border-line shadow-2xl overflow-hidden"
+      style={{ width: "min(440px, 92vw)" }}
+    >
       <div className="p-5">
         <div className="text-[11px] uppercase tracking-[0.16em] font-mono text-ink-faint">Delete session</div>
         <div className="mt-2 text-[13px] text-ink-soft leading-relaxed">
@@ -6060,7 +7156,17 @@ function PickerColumnView({
   );
 }
 
-function Modal({ children }: { children: React.ReactNode }) {
+function Modal({
+  children,
+  onDismiss,
+}: {
+  children: React.ReactNode;
+  /** Called when the user clicks the backdrop or presses Escape. Pass
+   *  null/omit for non-dismissible modals (permission prompts,
+   *  AskUserQuestion) — those demand an explicit choice from the
+   *  user. */
+  onDismiss?: () => void;
+}) {
   // Portal into document.body so the fixed overlay escapes any ancestor
   // that has a transform / filter / will-change set. Modals-inside-modals
   // (e.g. the folder picker invoked from the workspace-create modal) were
@@ -6068,6 +7174,28 @@ function Modal({ children }: { children: React.ReactNode }) {
   // viewport because Framer Motion's transform breaks `position: fixed`.
   const [mounted, setMounted] = useState(false);
   useEffect(() => { setMounted(true); }, []);
+  // Esc → dismiss, for dismissible modals only. We also stop here at
+  // the document level so nested modal-level Esc handlers don't
+  // double-fire.
+  useEffect(() => {
+    if (!onDismiss) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onDismiss();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onDismiss]);
+  // Backdrop click → dismiss. Only fires when the click target IS the
+  // overlay itself; anything inside the content card bubbles up but
+  // its target is the child, so we skip.
+  const onBackdrop = onDismiss
+    ? (e: React.MouseEvent<HTMLDivElement>) => {
+        if (e.target === e.currentTarget) onDismiss();
+      }
+    : undefined;
   const tree = (
     <motion.div
       className="fixed inset-0 z-40 flex items-end sm:items-center justify-center p-4 sm:p-8 bg-black/8"
@@ -6075,13 +7203,20 @@ function Modal({ children }: { children: React.ReactNode }) {
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.18, ease: EASE_OUT }}
+      onClick={onBackdrop}
     >
       <motion.div
         initial={{ opacity: 0, y: 12, scale: 0.98 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: 8, scale: 0.98 }}
         transition={{ duration: 0.26, ease: EASE_OUT }}
-        className="w-full max-w-lg origin-bottom sm:origin-center"
+        // The wrapper used to clamp itself to max-w-lg (512px), but the
+        // bigger modals (SettingsModal at 800px, FolderPicker, etc.)
+        // set their own width inline and overflow the wrapper, which
+        // shifts their visual center off-viewport. Sizing the wrapper
+        // to its child lets each modal own its width and stay
+        // viewport-centered.
+        className="origin-bottom sm:origin-center"
       >
         {children}
       </motion.div>

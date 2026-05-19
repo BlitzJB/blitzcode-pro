@@ -17,6 +17,7 @@ from workspaces import (
     Workspace,
     WorkspaceRepo,
     WorkspaceStore,
+    create_chat,
     create_workspace,
     delete_workspace,
     is_valid_ticket_key,
@@ -277,3 +278,88 @@ async def test_delete_workspace_removes_dir(tmp_path: Path):
     assert ok
     assert not (ws_root / "LLM-400").exists()
     assert store.get(ws.id) is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Chat workspaces — kind="chat", no ticket, no repos
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_chat_makes_empty_dir(tmp_path: Path):
+    store = WorkspaceStore(tmp_path / "ws.json")
+    ws_root = tmp_path / "workspaces"
+    ws = await create_chat(store, workspaces_root=ws_root, title="hello")
+    assert ws.kind == "chat"
+    assert ws.ticket_key == ""
+    assert ws.ticket_title == "hello"
+    assert ws.repos == []
+    assert ws.session_ids == []
+    assert Path(ws.dir).is_dir()
+    assert Path(ws.dir).parent == ws_root / "chats"
+    # Persistence round-trip preserves kind.
+    other = WorkspaceStore(store._path)
+    got = other.get(ws.id)
+    assert got is not None and got.kind == "chat"
+
+
+@pytest.mark.asyncio
+async def test_create_chat_default_title(tmp_path: Path):
+    store = WorkspaceStore(tmp_path / "ws.json")
+    ws = await create_chat(store, workspaces_root=tmp_path / "workspaces")
+    assert ws.ticket_title and ws.ticket_title.startswith("Chat")
+
+
+@pytest.mark.asyncio
+async def test_chats_coexist_with_tickets(tmp_path: Path):
+    src = _make_repo(tmp_path, "src")
+    store = WorkspaceStore(tmp_path / "ws.json")
+    ws_root = tmp_path / "workspaces"
+    chat = await create_chat(store, workspaces_root=ws_root, title="brain dump")
+    ticket = await create_workspace(
+        store,
+        workspaces_root=ws_root,
+        ticket_key="LLM-500",
+        ticket_title="real ticket",
+        initiative_key=None,
+        repos=[RepoSpec(source_path=str(src))],
+    )
+    listed = store.list()
+    kinds = {w.id: w.kind for w in listed}
+    assert kinds[chat.id] == "chat"
+    assert kinds[ticket.id] == "ticket"
+
+
+@pytest.mark.asyncio
+async def test_delete_chat_removes_dir(tmp_path: Path):
+    store = WorkspaceStore(tmp_path / "ws.json")
+    ws_root = tmp_path / "workspaces"
+    chat = await create_chat(store, workspaces_root=ws_root)
+    chat_dir = Path(chat.dir)
+    assert chat_dir.exists()
+    ok = await delete_workspace(store, chat.id, force=True)
+    assert ok
+    assert not chat_dir.exists()
+    assert store.get(chat.id) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_workspaces_default_to_ticket_kind(tmp_path: Path):
+    """A workspace JSON written before the kind field existed should
+    load as kind='ticket' for backwards compat."""
+    path = tmp_path / "ws.json"
+    import json
+    legacy = {
+        "workspaces": [{
+            "id": "ws-legacy",
+            "ticket_key": "OLD-1",
+            "ticket_title": "vintage",
+            "initiative_key": None,
+            "dir": "/tmp/legacy",
+            "created_at": 1000.0,
+        }],
+    }
+    path.write_text(json.dumps(legacy))
+    store = WorkspaceStore(path)
+    got = store.get("ws-legacy")
+    assert got is not None and got.kind == "ticket"

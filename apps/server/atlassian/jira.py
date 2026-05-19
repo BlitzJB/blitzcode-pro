@@ -169,6 +169,81 @@ class JiraClient:
             r = await c.post("/rest/greenhopper/1.0/xboard/issue/flag/flag.json", json=payload)
         _ok(r, expect=(200, 204))
 
+    async def create_issue(
+        self,
+        *,
+        project_key: str,
+        summary: str,
+        description_adf: Optional[dict] = None,
+        issuetype: str = "Task",
+        labels: Optional[list[str]] = None,
+        priority: Optional[str] = None,
+        parent_key: Optional[str] = None,
+        extra_fields: Optional[dict[str, Any]] = None,
+    ) -> dict:
+        """Create a JIRA issue. Returns the API response (contains the
+        new key + id + self URL). `description_adf` must be an ADF
+        document if provided; agent gives us markdown and we convert
+        upstream. `parent_key` attaches the issue under an epic on
+        Cloud (uses `parent` field; the legacy `customfield_10014`
+        epic-link isn't required on next-gen projects)."""
+        fields: dict[str, Any] = {
+            "project": {"key": project_key},
+            "summary": summary,
+            "issuetype": {"name": issuetype},
+        }
+        if description_adf is not None:
+            fields["description"] = description_adf
+        if labels:
+            fields["labels"] = list(labels)
+        if priority:
+            fields["priority"] = {"name": priority}
+        if parent_key:
+            fields["parent"] = {"key": parent_key}
+        if extra_fields:
+            fields.update(extra_fields)
+        async with self._client() as c:
+            r = await c.post("/rest/api/3/issue", json={"fields": fields})
+        return _ok(r, expect=(201, 200))
+
+    async def changelog(self, key: str, *, max_items: int = 50) -> list[dict]:
+        """Issue history: who changed what when. Returns a flattened
+        list of `{created, author, field, from, to}` rows, most recent
+        first. Uses the dedicated `/changelog` endpoint (paginated;
+        we keep the first page only — agents rarely need the deep tail)."""
+        async with self._client() as c:
+            r = await c.get(
+                f"/rest/api/3/issue/{key}/changelog",
+                params={"maxResults": max_items},
+            )
+        data = _ok(r)
+        rows: list[dict] = []
+        for entry in data.get("values") or []:
+            created = entry.get("created")
+            author = ((entry.get("author") or {}).get("displayName")) or None
+            for item in entry.get("items") or []:
+                rows.append({
+                    "created": created,
+                    "author": author,
+                    "field": item.get("field"),
+                    "from": item.get("fromString") or item.get("from"),
+                    "to": item.get("toString") or item.get("to"),
+                })
+        rows.sort(key=lambda r: r.get("created") or "", reverse=True)
+        return rows
+
+    async def list_projects(self) -> list[dict]:
+        """Lightweight project listing — key + name + id only. Used by
+        the chat agent to figure out which project a new ticket belongs
+        in when the user says 'create a ticket for X'."""
+        async with self._client() as c:
+            r = await c.get("/rest/api/3/project/search", params={"expand": ""})
+        data = _ok(r)
+        return [
+            {"key": p.get("key"), "name": p.get("name"), "id": p.get("id")}
+            for p in (data.get("values") or [])
+        ]
+
     async def link_action_item(self, from_key: str, to_key: str) -> None:
         """Create an inward "Action item" link FROM `from_key` TO `to_key`."""
         payload = {

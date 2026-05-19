@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -26,19 +26,27 @@ from workspaces import (
     Workspace,
     WorkspaceRepo,
     WorkspaceStore,
+    create_chat,
     create_workspace,
     delete_workspace,
     is_valid_ticket_key,
 )
-from workflow_prompt import render_workflow_prompt
+from workflow_prompt import render_chat_prompt, render_workflow_prompt
 from atlassian_creds import CredsStore
 from atlassian.jira import JiraClient, JiraError
 from atlassian.confluence import ConfluenceClient, ConfluenceError
 from settings import SettingsStore
+from lan_access import LanAccessStore, make_lan_auth_middleware
+from ngrok_tunnel import NgrokAuthStore, NgrokTunnel
 from workflow_mcp.workflow import (
     ALLOWED_TOOL_PATTERNS as WORKFLOW_ALLOWED_TOOLS,
     WorkflowDeps,
     build_workflow_mcp_server,
+)
+from workflow_mcp.chat import (
+    ALLOWED_TOOL_PATTERNS as CHAT_ALLOWED_TOOLS,
+    ChatDeps,
+    build_chat_mcp_server,
 )
 import git_worktree as gw
 
@@ -103,6 +111,19 @@ workspace_store = WorkspaceStore(_BLITZ_PRO_ROOT / "workspaces.json")
 initiative_store = InitiativeStore(_BLITZ_PRO_ROOT / "initiatives.json")
 creds_store = CredsStore(_BLITZ_PRO_ROOT / "atlassian-creds.json")
 settings_store = SettingsStore(_BLITZ_PRO_ROOT / "settings.json")
+lan_access_store = LanAccessStore(_BLITZ_PRO_ROOT / "lan-access.json")
+ngrok_auth_store = NgrokAuthStore(_BLITZ_PRO_ROOT / "ngrok-creds.json")
+# Lazily-instantiated so unit tests that import main.py don't trigger
+# the ngrok native binary load. The tunnel object itself does no I/O
+# until start() is called.
+_ngrok_tunnel: Optional[NgrokTunnel] = None
+
+
+def _tunnel() -> NgrokTunnel:
+    global _ngrok_tunnel
+    if _ngrok_tunnel is None:
+        _ngrok_tunnel = NgrokTunnel()
+    return _ngrok_tunnel
 
 # ────────────────────────────────────────────────────────────────────────────
 # Workflow prompt injection — called per session-creation by the SDK factory.
@@ -117,6 +138,8 @@ def _workflow_system_prompt_append(config: SessionConfig) -> Optional[str]:
     ws = workspace_store.get(config.workspace_id)
     if ws is None:
         return None
+    if ws.kind == "chat":
+        return render_chat_prompt(ws)
     initiative_name: Optional[str] = None
     if ws.initiative_key:
         initiative = initiative_store.get(ws.initiative_key)
@@ -125,19 +148,17 @@ def _workflow_system_prompt_append(config: SessionConfig) -> Optional[str]:
     return render_workflow_prompt(ws, initiative_display_name=initiative_name)
 
 
-# Build the workflow MCP server lazily on first session that needs it. The
-# build closes over the real SDK import (claude_agent_sdk) which we don't
-# want to load at module import — keeps test fixtures + non-SDK
+# Build the MCP servers lazily on first session that needs them. The
+# build closes over the real SDK import (claude_agent_sdk) which we
+# don't want to load at module import — keeps test fixtures + non-SDK
 # environments importing this module cleanly.
-_workflow_server_cache: dict = {}
+_mcp_server_cache: dict = {}
 
 
-def _workflow_extra_mcp_servers(config: SessionConfig) -> Optional[dict[str, Any]]:
-    if not config.workspace_id:
-        return None
-    if "server" not in _workflow_server_cache:
+def _ensure_workflow_server():
+    if "workflow" not in _mcp_server_cache:
         try:
-            _workflow_server_cache["server"] = build_workflow_mcp_server(
+            _mcp_server_cache["workflow"] = build_workflow_mcp_server(
                 WorkflowDeps(
                     creds_store=creds_store,
                     workspace_store=workspace_store,
@@ -146,12 +167,62 @@ def _workflow_extra_mcp_servers(config: SessionConfig) -> Optional[dict[str, Any
             )
         except ImportError:  # pragma: no cover — claude_agent_sdk missing
             return None
-    return {"workflow": _workflow_server_cache["server"]}
+    return _mcp_server_cache["workflow"]
+
+
+def _ensure_chat_server():
+    if "chat" not in _mcp_server_cache:
+        try:
+            _mcp_server_cache["chat"] = build_chat_mcp_server(
+                ChatDeps(
+                    initiative_store=initiative_store,
+                    settings_store=settings_store,
+                    workspace_store=workspace_store,
+                    workspaces_root=_WORKSPACES_ROOT,
+                    # Late-bound: app.state.registry isn't populated
+                    # until the lifespan runs. Capture by reference.
+                    get_registry=lambda: app.state.registry,
+                    broadcast=_broadcast,
+                )
+            )
+        except ImportError:  # pragma: no cover — claude_agent_sdk missing
+            return None
+    return _mcp_server_cache["chat"]
+
+
+def _workflow_extra_mcp_servers(config: SessionConfig) -> Optional[dict[str, Any]]:
+    """MCP attach policy:
+      * ticket workspace → workflow MCP only.
+      * chat workspace → workflow + chat MCP. Chat is the meta-agent so
+        it gets the full workspace-agent surface PLUS the app-level
+        management tools (initiatives, settings, workspaces, sessions).
+    """
+    if not config.workspace_id:
+        return None
+    ws = workspace_store.get(config.workspace_id)
+    if ws is None:
+        return None
+    out: dict[str, Any] = {}
+    wfs = _ensure_workflow_server()
+    if wfs is not None:
+        out["workflow"] = wfs
+    if ws.kind == "chat":
+        chs = _ensure_chat_server()
+        if chs is not None:
+            out["chat"] = chs
+    return out or None
 
 
 def _workflow_extra_allowed_tools(config: SessionConfig) -> Optional[list[str]]:
+    """Mirror the MCP attach policy: chat agents get the union of
+    workflow + chat tool allowlists; ticket agents get only workflow."""
     if not config.workspace_id:
         return None
+    ws = workspace_store.get(config.workspace_id)
+    if ws is None:
+        return None
+    if ws.kind == "chat":
+        return list(WORKFLOW_ALLOWED_TOOLS) + list(CHAT_ALLOWED_TOOLS)
     return list(WORKFLOW_ALLOWED_TOOLS)
 
 
@@ -173,12 +244,31 @@ app.add_middleware(
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "x-blitz-token"],
 )
+
+# LAN-access auth middleware — pure ASGI rather than FastAPI
+# BaseHTTPMiddleware so it doesn't buffer SSE bodies. We wrap at the
+# uvicorn boundary in `__main__` below so route decorators registered
+# later in this file still bind to the underlying FastAPI app.
+_lan_auth = make_lan_auth_middleware(lan_access_store)
 
 # ────────────────────────────────────────────────────────────────────────────
 # "Needs input" tracking — listens to result events on the global event log.
 # ────────────────────────────────────────────────────────────────────────────
+
+
+def _broadcast(event: str, data: dict) -> None:
+    """Fan an app-level wire event out to every connected client via
+    the global event log. Empty session_id is the sentinel — the React
+    reducer's `server_event` handler early-returns on falsy session_id,
+    so we get a clean broadcast without creating a phantom session
+    entry on the client side. Best-effort: never let a broadcast
+    failure break the mutation that called it."""
+    try:
+        app.state.registry.event_log.append("", event, data)
+    except Exception:
+        pass
 
 
 async def _watch_completions() -> None:
@@ -209,6 +299,14 @@ async def _chained_lifespan(app_: FastAPI):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+            # Tear down the ngrok tunnel if one was started. Never raise
+            # — the process is dying either way and we don't want to
+            # corrupt the lifespan teardown of upstream layers.
+            if _ngrok_tunnel is not None:
+                try:
+                    await _ngrok_tunnel.shutdown()
+                except Exception:
+                    pass
 
 
 app.router.lifespan_context = _chained_lifespan
@@ -349,6 +447,7 @@ async def create_initiative(body: InitiativeIn) -> dict:
         repo_paths=list(body.repo_paths),
     )
     saved = await initiative_store.upsert(it)
+    _broadcast("app:initiative_created", {"key": saved.key})
     return _initiative_dict(saved)
 
 
@@ -365,6 +464,7 @@ async def patch_initiative(key: str, body: InitiativePatch) -> dict:
     updated = await initiative_store.patch(key, **fields)
     if updated is None:
         raise HTTPException(status_code=404, detail="Initiative not found")
+    _broadcast("app:initiative_updated", {"key": updated.key})
     return _initiative_dict(updated)
 
 
@@ -373,6 +473,7 @@ async def delete_initiative(key: str) -> dict:
     ok = await initiative_store.remove(key)
     if not ok:
         raise HTTPException(status_code=404, detail="Initiative not found")
+    _broadcast("app:initiative_deleted", {"key": key})
     return {"ok": True}
 
 
@@ -410,6 +511,7 @@ def _workspace_dict(ws: Workspace) -> dict:
         "docs": {k: v.to_dict() for k, v in ws.docs.items()},
         "created_at": ws.created_at,
         "archived_at": ws.archived_at,
+        "kind": ws.kind,
     }
 
 
@@ -463,6 +565,7 @@ async def post_workspace(body: CreateWorkspaceIn) -> dict:
             permission_mode=body.permission_mode,
             model=body.model,
         )
+    _broadcast("app:workspace_created", {"workspace_id": ws.id, "kind": ws.kind})
     return {
         "workspace": _workspace_dict(workspace_store.get(ws.id) or ws),
         "first_session_id": first_session_id,
@@ -495,6 +598,7 @@ async def patch_workspace(workspace_id: str, body: PatchWorkspaceIn) -> dict:
         ws = await workspace_store.unarchive(workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace disappeared")
+    _broadcast("app:workspace_updated", {"workspace_id": workspace_id})
     return _workspace_dict(ws)
 
 
@@ -504,6 +608,8 @@ async def remove_workspace(workspace_id: str, force: bool = True) -> dict:
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     ok = await delete_workspace(workspace_store, workspace_id, force=force)
+    if ok:
+        _broadcast("app:workspace_deleted", {"workspace_id": workspace_id})
     return {"ok": ok}
 
 
@@ -529,6 +635,7 @@ async def add_repo(workspace_id: str, body: AddRepoIn) -> dict:
     updated = await workspace_store.add_repo(workspace_id, repo)
     if updated is None:
         raise HTTPException(status_code=404, detail="Workspace disappeared")
+    _broadcast("app:workspace_updated", {"workspace_id": workspace_id})
     return _workspace_dict(updated)
 
 
@@ -549,7 +656,48 @@ async def spawn_session(workspace_id: str, body: SpawnSessionIn) -> dict:
         model=body.model,
         include_partial_messages=body.include_partial_messages,
     )
+    _broadcast("app:workspace_updated", {"workspace_id": workspace_id})
     return {"session_id": sid, "workspace": _workspace_dict(workspace_store.get(workspace_id) or ws)}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Chats — scratch workspaces (kind="chat") for ad-hoc agent conversation.
+# No ticket, no repos. Multiple chats coexist with ticket workspaces in
+# the sidebar; the agent inside gets the chat-MCP attached so it can
+# manage initiatives + settings on the user's behalf.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class CreateChatIn(BaseModel):
+    title: Optional[str] = None  # defaults to "Chat · <timestamp>"
+    permission_mode: Optional[str] = "acceptEdits"
+    model: Optional[str] = None
+    spawn_initial_session: bool = True
+
+
+@app.post("/app/chats")
+async def post_chat(body: CreateChatIn) -> dict:
+    try:
+        ws = await create_chat(
+            workspace_store,
+            workspaces_root=_WORKSPACES_ROOT,
+            title=body.title,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    first_session_id: Optional[str] = None
+    if body.spawn_initial_session:
+        first_session_id = await _spawn_session_into_workspace(
+            ws,
+            permission_mode=body.permission_mode,
+            model=body.model,
+        )
+    _broadcast("app:workspace_created", {"workspace_id": ws.id, "kind": ws.kind})
+    return {
+        "workspace": _workspace_dict(workspace_store.get(ws.id) or ws),
+        "first_session_id": first_session_id,
+    }
 
 
 class RenameSessionIn(BaseModel):
@@ -561,6 +709,7 @@ async def rename_session(workspace_id: str, session_id: str, body: RenameSession
     updated = await workspace_store.set_session_name(workspace_id, session_id, body.name)
     if updated is None:
         raise HTTPException(status_code=404, detail="Workspace or session not found")
+    _broadcast("app:workspace_updated", {"workspace_id": workspace_id})
     return _workspace_dict(updated)
 
 
@@ -581,6 +730,7 @@ async def delete_session(workspace_id: str, session_id: str) -> dict:
     updated = await workspace_store.remove_session(workspace_id, session_id)
     if updated is None:
         raise HTTPException(status_code=404, detail="Workspace disappeared")
+    _broadcast("app:workspace_updated", {"workspace_id": workspace_id})
     return _workspace_dict(updated)
 
 
@@ -631,13 +781,17 @@ async def atlassian_set_creds(body: AtlassianCredsIn) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     # Echo back only public metadata; never the token.
-    return creds_store.public_meta()
+    meta = creds_store.public_meta()
+    _broadcast("app:creds_updated", {"has_creds": meta.get("has_creds", False)})
+    return meta
 
 
 @app.delete("/app/atlassian/creds")
 async def atlassian_clear_creds() -> dict:
     await creds_store.clear()
-    return creds_store.public_meta()
+    meta = creds_store.public_meta()
+    _broadcast("app:creds_updated", {"has_creds": meta.get("has_creds", False)})
+    return meta
 
 
 def _jira_client_or_400() -> JiraClient:
@@ -768,7 +922,149 @@ async def get_settings() -> dict:
 async def patch_settings(updates: dict) -> dict:
     """Shallow-merge per category. Pass `null` for a key to delete it."""
     merged = await settings_store.patch(updates or {})
+    _broadcast("app:settings_updated", {})
     return {"settings": merged}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# LAN access — phone-as-second-client. The host binds 0.0.0.0 unconditionally,
+# but the lan_access middleware drops every non-loopback request unless the
+# feature is enabled AND the request presents the stored token.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _lan_ip() -> Optional[str]:
+    """Best-effort: what's the IP another machine on this LAN would
+    reach us at? We "connect" a UDP socket (no packet is sent) so the
+    kernel picks the egress interface and we read its address. Returns
+    None if no network is up."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def _lan_urls(port: int, token: Optional[str]) -> list[str]:
+    ip = _lan_ip()
+    if not ip or ip.startswith("127."):
+        return []
+    base = f"http://{ip}:{port}/"
+    if token:
+        return [f"{base}?k={token}"]
+    return [base]
+
+
+def _lan_access_dict(port: int) -> dict:
+    """Single source of truth for the shape every LAN-access endpoint
+    returns. Includes the tunnel substate so the UI can render Network
+    settings off one round-trip."""
+    meta = lan_access_store.public_meta()
+    tunnel_status = _tunnel().status() if _ngrok_tunnel is not None else {"state": "off", "url": None, "error": None}
+    tunnel_url = tunnel_status.get("url")
+    public_join_url = (
+        f"{tunnel_url.rstrip('/')}/?k={meta.get('token')}"
+        if tunnel_url and meta.get("token")
+        else None
+    )
+    return {
+        **meta,
+        "lan_urls": _lan_urls(port, meta.get("token")),
+        "tunnel": {
+            **tunnel_status,
+            "configured": ngrok_auth_store.public_meta()["configured"],
+            "public_join_url": public_join_url,
+        },
+    }
+
+
+@app.get("/app/lan-access")
+async def get_lan_access(request: Request) -> dict:
+    port = request.url.port or int(os.environ.get("BLITZCODE_PRO_PORT", "51820"))
+    return _lan_access_dict(port)
+
+
+class LanAccessIn(BaseModel):
+    enabled: Optional[bool] = None
+    tunnel_enabled: Optional[bool] = None
+
+
+@app.post("/app/lan-access")
+async def set_lan_access(body: LanAccessIn, request: Request) -> dict:
+    """Single endpoint owns LAN + tunnel toggles. Cascades:
+      * disabling LAN access force-stops the tunnel (no auth = no public
+        exposure ever).
+      * enabling the tunnel auto-enables LAN access if it wasn't on,
+        and rotates the LAN token so a leaked-over-WiFi token can't be
+        replayed over the public URL.
+    """
+    port = request.url.port or int(os.environ.get("BLITZCODE_PRO_PORT", "51820"))
+
+    if body.tunnel_enabled is True:
+        if not ngrok_auth_store.get_authtoken():
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "ngrok_authtoken_missing", "message": "Set the ngrok authtoken first."},
+            )
+        # Auto-enable LAN + rotate the token so the public URL ships a
+        # fresh secret. Anyone holding the old WiFi-shared token loses
+        # access at this moment, which is the right thing to do.
+        lan_access_store.enable()
+        try:
+            await _tunnel().start(port, ngrok_auth_store.get_authtoken() or "")
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "tunnel_failed", "message": str(e)},
+            )
+    elif body.tunnel_enabled is False:
+        await _tunnel().stop()
+
+    if body.enabled is True:
+        lan_access_store.enable()
+    elif body.enabled is False:
+        # Cascade: dropping LAN access kills the tunnel.
+        await _tunnel().stop()
+        lan_access_store.disable()
+
+    payload = _lan_access_dict(port)
+    _broadcast(
+        "app:lan_access_toggled",
+        {
+            "enabled": payload.get("enabled", False),
+            "tunnel_state": payload["tunnel"]["state"],
+            "tunnel_url": payload["tunnel"].get("url"),
+        },
+    )
+    return payload
+
+
+class NgrokAuthIn(BaseModel):
+    authtoken: str
+
+
+@app.post("/app/lan-access/ngrok-authtoken")
+async def set_ngrok_authtoken(body: NgrokAuthIn, request: Request) -> dict:
+    try:
+        await ngrok_auth_store.set(body.authtoken)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    port = request.url.port or int(os.environ.get("BLITZCODE_PRO_PORT", "51820"))
+    return _lan_access_dict(port)
+
+
+@app.delete("/app/lan-access/ngrok-authtoken")
+async def clear_ngrok_authtoken(request: Request) -> dict:
+    # Force-stop the tunnel — running it without the token configured
+    # would be confusing if the user toggles off and back on.
+    await _tunnel().stop()
+    await ngrok_auth_store.clear()
+    port = request.url.port or int(os.environ.get("BLITZCODE_PRO_PORT", "51820"))
+    return _lan_access_dict(port)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -787,6 +1083,11 @@ if _web_dist:
         app.mount("/", StaticFiles(directory=str(_web_path), html=True), name="web")
 
 
+async def gated_app(scope, receive, send):
+    """ASGI entrypoint: LAN-auth middleware wrapping the FastAPI app."""
+    return await _lan_auth(scope, receive, send, app)
+
+
 if __name__ == "__main__":
     # Port priority: explicit env > dev default. Bundled mode sets the
     # env var to an ephemeral port chosen by the Rust shell.
@@ -795,4 +1096,4 @@ if __name__ == "__main__":
     # When bundled, suppress uvicorn's own log_config so our root file
     # handler captures everything (otherwise dictConfig stomps it).
     log_config = None if _BUNDLED else uvicorn.config.LOGGING_CONFIG
-    uvicorn.run(app, host=host, port=port, log_config=log_config)
+    uvicorn.run(gated_app, host=host, port=port, log_config=log_config)

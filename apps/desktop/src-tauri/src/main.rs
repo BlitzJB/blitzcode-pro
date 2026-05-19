@@ -32,13 +32,18 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// JavaScript injected into the WebView before the page loads. Mirrors
-/// Tauri's bundled `drag.js` (which only runs for the tauri:// protocol)
-/// so any element marked `data-tauri-drag-region` becomes a window-drag
-/// handle that also responds to double-click-to-maximize. Bound at
-/// mousedown specifically: NSWindow needs the gesture handed off
-/// synchronously inside the native event loop.
+/// JavaScript injected into the WebView before the page loads. Tauri's
+/// bundled init script only runs for the `tauri://` protocol; we load
+/// the UI from FastAPI on `http://127.0.0.1:port/`, so we re-implement
+/// the bits we need:
+///   1. `data-tauri-drag-region` → window-drag + double-click maximize.
+///      Bound at `mousedown` synchronously so AppKit can pick up the
+///      native drag gesture.
+///   2. External `<a>` clicks → open in the system default browser via
+///      the opener plugin. Without this, clicking a JIRA / Confluence /
+///      anywhere-external link navigates the WebView away from our app.
 const DRAG_REGION_SCRIPT: &str = r#"
+// ── Drag region + double-click maximize ────────────────────────────────
 document.addEventListener('mousedown', function (e) {
     if (e.button !== 0) return;
     var t = e.target;
@@ -53,6 +58,31 @@ document.addEventListener('mousedown', function (e) {
         window.__TAURI_INTERNALS__.invoke('plugin:window|start_dragging');
     }
 });
+
+// ── External link → system browser ────────────────────────────────────
+document.addEventListener('click', function (e) {
+    if (e.defaultPrevented) return;
+    if (e.button !== 0) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; // honor modifier-click intent
+    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+    if (!a) return;
+    var href = a.getAttribute('href');
+    if (!href) return;
+    // Resolve relative URLs against the current page so we can compare
+    // origins reliably.
+    var url;
+    try { url = new URL(href, window.location.href); }
+    catch (_) { return; }
+    // Allow same-origin nav (in-app routing, anchor links, asset fetches).
+    if (url.origin === window.location.origin && url.protocol !== 'mailto:' && url.protocol !== 'tel:') return;
+    // External — hand off to the OS.
+    e.preventDefault();
+    try {
+        window.__TAURI_INTERNALS__.invoke('plugin:opener|open_url', { url: url.toString() });
+    } catch (err) {
+        console.error('opener invoke failed', err);
+    }
+}, true);  // capture-phase: beats any React handler that may stopPropagation
 "#;
 
 /// Holds the Python child so we can kill it on shutdown. Wrapped in
@@ -99,6 +129,7 @@ fn run() -> Result<()> {
     let sup_for_exit = Arc::clone(&supervisor);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .manage(sup_for_setup)
         .setup(move |app| {
             let url = format!("http://127.0.0.1:{port}/")
@@ -236,7 +267,13 @@ fn spawn_python(layout: &Layout, port: u16) -> Result<Child> {
         .arg("main")
         .env("BLITZCODE_PRO_BUNDLED", "1")
         .env("BLITZCODE_PRO_PORT", port.to_string())
-        .env("BLITZCODE_PRO_HOST", "127.0.0.1")
+        // Bind on all interfaces so the optional "LAN access" feature
+        // can serve to the user's phone. Non-loopback requests are
+        // gated by lan_access middleware on the Python side — when the
+        // feature is disabled they get 403, so this is no more exposed
+        // than any other unauth'd local port. Tauri's WebView always
+        // connects via 127.0.0.1, which the middleware bypasses.
+        .env("BLITZCODE_PRO_HOST", "0.0.0.0")
         .env("BLITZCODE_PRO_WEB_DIST", &layout.web_dist)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

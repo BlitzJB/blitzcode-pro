@@ -192,6 +192,57 @@ class ConfluenceClient:
             raise ConfluenceError(status=500, message="Page missing spaceId — cannot infer space for create")
         return page.space_id
 
+    async def list_versions(self, page_id: str, *, limit: int = 50) -> list[dict]:
+        """Version history of a page. Each entry has number, message,
+        createdAt, authorId. Most-recent first per the v2 API. Lets the
+        chat agent answer 'what changed and when' on RFC/debrief pages."""
+        async with self._client() as c:
+            r = await c.get(
+                f"/wiki/api/v2/pages/{page_id}/versions",
+                params={"limit": limit},
+            )
+        data = _ok(r)
+        return [
+            {
+                "number": entry.get("number"),
+                "message": entry.get("message") or "",
+                "created_at": entry.get("createdAt"),
+                "author_id": entry.get("authorId"),
+                "minor_edit": bool(entry.get("minorEdit")),
+            }
+            for entry in (data.get("results") or [])
+        ]
+
+    async def get_page_at_version(self, page_id: str, version: int) -> dict:
+        """Fetch one historical version's ADF body. v2 returns body
+        in atlas_doc_format only when explicitly requested."""
+        async with self._client() as c:
+            r = await c.get(
+                f"/wiki/api/v2/pages/{page_id}/versions/{version}",
+                params={"body-format": "atlas_doc_format"},
+            )
+        data = _ok(r)
+        body = (data.get("body") or {}).get("atlas_doc_format") or {}
+        value = body.get("value")
+        adf: dict
+        if isinstance(value, str):
+            import json as _json
+            try:
+                adf = _json.loads(value)
+            except (ValueError, TypeError):
+                adf = {"type": "doc", "version": 1, "content": []}
+        elif isinstance(value, dict):
+            adf = value
+        else:
+            adf = {"type": "doc", "version": 1, "content": []}
+        return {
+            "number": data.get("number"),
+            "title": data.get("title"),
+            "created_at": data.get("createdAt"),
+            "message": data.get("message") or "",
+            "body_adf": adf,
+        }
+
 
 # ────────────────────────────────────────────────────────────────────────────
 

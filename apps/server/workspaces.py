@@ -68,6 +68,15 @@ class DocRef:
         )
 
 
+# Workspace flavors. "ticket" is the JIRA-bound, worktree-having default
+# the app shipped with. "chat" is a tickle-less scratch workspace for
+# general-purpose conversation with the agent — no ticket, no repos, no
+# RFC/debrief; gets the chat-MCP attached instead of the workflow-MCP.
+# Stored as a string for forward-compat: future kinds (e.g. "review",
+# "incident") can land without a schema migration.
+WORKSPACE_KINDS = ("ticket", "chat")
+
+
 @dataclass
 class Workspace:
     id: str
@@ -84,6 +93,7 @@ class Workspace:
     docs: dict[str, DocRef] = field(default_factory=dict)  # "rfc" | "debrief"
     created_at: float = field(default_factory=time.time)
     archived_at: Optional[float] = None
+    kind: str = "ticket"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -94,6 +104,9 @@ class Workspace:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Workspace":
+        kind = str(data.get("kind") or "ticket")
+        if kind not in WORKSPACE_KINDS:
+            kind = "ticket"
         return cls(
             id=str(data["id"]),
             ticket_key=str(data["ticket_key"]),
@@ -114,6 +127,7 @@ class Workspace:
             },
             created_at=float(data.get("created_at", time.time())),
             archived_at=(float(data["archived_at"]) if data.get("archived_at") is not None else None),
+            kind=kind,
         )
 
 
@@ -353,6 +367,48 @@ async def create_workspace(
         docs={},
     )
     return await store.insert(ws)
+
+
+async def create_chat(
+    store: WorkspaceStore,
+    *,
+    workspaces_root: Path,
+    title: Optional[str] = None,
+) -> Workspace:
+    """Materialize a chat workspace: empty scratch dir under
+    workspaces_root/chats/<short-uuid>/, no ticket, no repos.
+
+    The agent inside gets the chat-MCP attached (initiatives + settings
+    tools) and a chat-specific system prompt. Multiple chats can coexist;
+    each is independently switchable from the sidebar.
+    """
+    workspace_id = str(uuid.uuid4())
+    short = workspace_id.split("-")[0]
+    chats_root = workspaces_root / "chats"
+    workspace_dir = chats_root / short
+    workspace_dir.mkdir(parents=True, exist_ok=False)
+    display = (title or "").strip() or _default_chat_title()
+    ws = Workspace(
+        id=workspace_id,
+        ticket_key="",
+        ticket_title=display,
+        initiative_key=None,
+        dir=str(workspace_dir),
+        repos=[],
+        session_ids=[],
+        docs={},
+        kind="chat",
+    )
+    return await store.insert(ws)
+
+
+def _default_chat_title() -> str:
+    """A short, human-ish name for a freshly-spawned chat. Keeps the
+    sidebar legible until the user (or agent) renames it."""
+    import datetime as _dt
+    now = _dt.datetime.now()
+    # "Chat · May 19, 11:05 pm" → distinct enough at-a-glance.
+    return now.strftime("Chat · %b %d, %I:%M %p").replace(" 0", " ").lower().replace("chat ·", "Chat ·")
 
 
 async def delete_workspace(
